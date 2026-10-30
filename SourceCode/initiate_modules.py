@@ -4,6 +4,7 @@ Created on Fri Dec  5 09:44:43 2025
 
 @author: hartvig
 """
+import os
 import pandas as pd
 import numpy as np
 import time
@@ -27,6 +28,18 @@ from SourceCode.trade import trade
 from SourceCode.investment import invest
 from SourceCode.employment import empl
 from SourceCode.cost_curves import cost_curves
+
+def _hh_save_rate_from_real_income(V, lag_year):
+    # ! build the trailing save-rate benchmark from real_income_hh/real_spend_hh -- the
+    # ! exact quantities household.py's endog_save is computed from -- rather than the
+    # ! compensation-only save_rate proxy. real_spend_hh is captured before windfall
+    # ! spend is added (household.py::calc_hh_demand_change), so this is ex-windfall by
+    # ! construction, without needing a separate back-out.
+    ri = V.read_var('real_income_hh', lag_year, as_df=True)
+    rs = V.read_var('real_spend_hh', lag_year, as_df=True)
+    sr = ri.merge(rs, how='left', on='REG_imp')
+    sr['save_rate'] = 1 - sr['real_spend_hh'] / sr['real_income_hh']
+    return sr[['REG_imp','save_rate']]
 
 def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_df_DEF, CALIBRATING, CALIBRATION_VARS, year, Log, calibration_counter, V, ftt_model=None):
 
@@ -147,6 +160,22 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         self.V.write_var('save_rate', year-1, saving[['REG_imp','save_rate']], from_df=True)
         self.V.write_var('save_rate', year-2, saving[['REG_imp','save_rate']], from_df=True)
         self.V.write_var('save_rate', year-3, saving[['REG_imp','save_rate']], from_df=True)
+        # ! bootstrap years carry no windfall spend yet, so ex-windfall == save_rate here
+        saving_ex_windfall = saving[['REG_imp','save_rate']].rename(columns={'save_rate':'save_rate_ex_windfall'})
+        self.V.write_var('save_rate_ex_windfall', year-1, saving_ex_windfall, from_df=True)
+        self.V.write_var('save_rate_ex_windfall', year-2, saving_ex_windfall, from_df=True)
+        self.V.write_var('save_rate_ex_windfall', year-3, saving_ex_windfall, from_df=True)
+        # ! bootstrap real_income_hh/real_spend_hh on the same basis: at t0 there is no
+        # ! delta_inc/dlabor_cpi/quasi_CPI yet, so real_income == compensation and
+        # ! real_spend == VIPA exactly -- consistent with household.py's real_income calc
+        real_income_0 = comp_0.rename(columns={'compensation':'real_income_hh'})
+        real_spend_0 = cons_0.rename(columns={'VIPA':'real_spend_hh'})
+        self.V.write_var('real_income_hh', year-1, real_income_0, from_df=True)
+        self.V.write_var('real_income_hh', year-2, real_income_0, from_df=True)
+        self.V.write_var('real_income_hh', year-3, real_income_0, from_df=True)
+        self.V.write_var('real_spend_hh', year-1, real_spend_0, from_df=True)
+        self.V.write_var('real_spend_hh', year-2, real_spend_0, from_df=True)
+        self.V.write_var('real_spend_hh', year-3, real_spend_0, from_df=True)
 
         df = pd.DataFrame(columns=['REG_imp','PROD_COMM','TRAD_COMM','flow_price_impact_intermediates'])
         self.V.write_var('flow_price_impact_intermediates', year-2, df, from_df=True)
@@ -234,9 +263,69 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
 
     io_changes = Scenario.set_io_changes()
     Scenario.set_cost_shock()
+
+    # mask (region-outer, sector-inner vector order) for cells whose price
+    # change is fully exogenous: 'Price change' sheet rows with Type 'exog';
+    # those cells' price change is exactly the sheet value (all endogenous
+    # price mechanics disabled), other cells are untouched
+    exog_price_rows = Scenario.cost_shock[Scenario.cost_shock['Type'].str.contains('exog', na=False)].copy()
+    exog_price_rows = exog_price_rows[exog_price_rows['REG_imp'].isin(list(EXOG_VARS.R_list))]
+    if len(exog_price_rows) > 0:
+        exog_price_rows = exog_price_rows.assign(exog_price_flag=1.0)
+        exog_price_mask = MRIO_df_to_vec_DEF(exog_price_rows, 'exog_price_flag') > 0
+    else:
+        exog_price_mask = np.zeros(len(EXOG_VARS.R_list) * len(EXOG_VARS.P_list), dtype=bool)
+
+    # subset of exog_price_mask: 'exog-cprice' rows keep the carbon-tax (v_ctax)
+    # cost pass-through on top of the exogenous price, all other endogenous
+    # price mechanics (labour, profit deviation, output growth, cbam) stay disabled
+    exog_cprice_rows = Scenario.cost_shock[Scenario.cost_shock['Type'].str.contains('exog-cprice', na=False)].copy()
+    exog_cprice_rows = exog_cprice_rows[exog_cprice_rows['REG_imp'].isin(list(EXOG_VARS.R_list))]
+    if len(exog_cprice_rows) > 0:
+        exog_cprice_rows = exog_cprice_rows.assign(exog_cprice_flag=1.0)
+        exog_cprice_mask = MRIO_df_to_vec_DEF(exog_cprice_rows, 'exog_cprice_flag') > 0
+    else:
+        exog_cprice_mask = np.zeros(len(EXOG_VARS.R_list) * len(EXOG_VARS.P_list), dtype=bool)
     # Scenario.set_exog_inv(DYNAMIC['investment_vector'][year])
     Scenario.set_exog_inv(self.V.read_var('dk_base', year, as_df=True))
     self.V.write_var('inc_exog', year, Scenario.set_exog_inc().rename(columns={'dlabor_exog':'inc_exog'}), from_df=True)
+
+    # --- Remittance channel: inject lagged remittance LEVEL (less base) into inc_exog ---
+    # household.py:138 differences dlabor_exog YoY (dlabor_exog[t] - prev_dlabor_exog[t-1])
+    # to compute the income change entering recyc_inc_base. By injecting the lagged
+    # remittance LEVEL (less the bilateral base), the YoY differencing in household.py
+    # naturally recovers shock[year-1] = remit_level[year-1] - remit_level[year-2] as the
+    # per-year income flow into HH demand. Subtracting total_base means the injection is 0
+    # in steady state (level = base), keeping initialization clean (no spurious pulse from
+    # inc_exog_prev being empty in year model_start+1).
+    # At the start of year T's solve, DYNAMIC['remittance_last_level'][tgt] holds
+    # remit_level[T-1] (last updated in year T-1's solve_year at section 3.1.1).
+    if year > self.model_start and self.remittance_channel:  # inject remittance shock during both calibration and scenario
+        remit_params = EXOG_VARS.REMITTANCE_PARAMS
+        for tgt in remit_params['target_country'].unique():
+            total_base = remit_params[remit_params['target_country'] == tgt]['remittance_base_USDk'].sum()
+            remit_level_lag = DYNAMIC['remittance_last_level'].get(tgt, total_base)
+            inject = remit_level_lag - total_base  # lagged level relative to bilateral base
+            if inject != 0.0:
+                prev_shock = DYNAMIC['remittance_dlabor'].get((tgt, year - 1), 0.0)
+                print(f"    Remittance injection: {tgt} year {year} "
+                      f"(lagged level {remit_level_lag/1e3:,.0f}M, base {total_base/1e3:,.0f}M, "
+                      f"injection {inject/1e3:+,.0f}M; y{year-1} shock {prev_shock/1e3:+,.0f}M, '000 USD)")
+                inc_exog = self.V.read_var("inc_exog", year, as_df=True).rename(columns={'inc_exog':'dlabor_exog'})
+                if inc_exog.empty:
+                    inc_exog = pd.DataFrame({
+                        'REG_imp': [tgt],
+                        'dlabor_exog': [inject]
+                    })
+                elif tgt in inc_exog['REG_imp'].values:
+                    inc_exog.loc[inc_exog['REG_imp'] == tgt, 'dlabor_exog'] += inject
+                else:
+                    inc_exog = pd.concat([
+                        inc_exog,
+                        pd.DataFrame({'REG_imp': [tgt], 'dlabor_exog': [inject]})
+                    ], ignore_index=True)
+                self.V.write_var('inc_exog', year, inc_exog.rename(columns={'dlabor_exog':'inc_exog'}), from_df=True)
+
     Scenario.set_supply_constraint()
     Scenario.set_supply_constraint_no_empl()
     Scenario.set_capital_stock_change()
@@ -292,6 +381,7 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
     # ! if output was higher last year that might disappear becase IO has changed
     # ! a further issue is supply restrictions; we werent able to produce but the demand is there
     dq_structural_change = IO_model.q_base_curr - self.V.read_var("output", year-1)
+    self.V.write_var("dq_structural_change", year, dq_structural_change)
     # - DYNAMIC['dq_exog_hh_prev'] - DYNAMIC['dq_exog_gov_prev'] - DYNAMIC['dq_exog_fcf_prev'])
     dq_structural_change_wo_employment = dq_structural_change + DYNAMIC['dq_supply_constraint_no_empl']
 
@@ -328,22 +418,35 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
     ctax_price_impact = ctax_price_impact.rename(columns={'flow_price_impact_intermediates':'ctax_price_impact_1'})
     ctax_price_impact = ctax_price_impact_prev.merge(ctax_price_impact, how='outer').fillna(0)
     ctax_price_impact['ctax_price_impact'] = ctax_price_impact['ctax_price_impact_1'] - ctax_price_impact['ctax_price_impact_2']
-    ctax_price_impact.loc[ctax_price_impact['ctax_price_impact'] > 5.0, 'ctax_price_impact'] = 5.0
-    ctax_price_impact.loc[ctax_price_impact['ctax_price_impact'] < -5.0, 'ctax_price_impact'] = -5.0
+    # if year > 2025:
+        # import pdb; pdb.set_trace()
+    # ctax_price_impact.loc[ctax_price_impact['ctax_price_impact'] > 5.0, 'ctax_price_impact'] = 5.0
+
+    _out_of_range = ctax_price_impact.loc[(ctax_price_impact['ctax_price_impact'] > 3.0) | (ctax_price_impact['ctax_price_impact'] < -3.0)]
+    if len(_out_of_range) > 0:
+        for _idx, _row in _out_of_range.iterrows():
+            print(f"WARNING: ctax_price_impact out of range [-3.0, 3.0]: REG_imp={_row['REG_imp']} PROD_COMM={_row['PROD_COMM']} TRAD_COMM={_row['TRAD_COMM']} ctax_price_impact={_row['ctax_price_impact']} prev={_row['ctax_price_impact_2']}")
+
+
     ctax_price_impact = ctax_price_impact.drop(columns=['ctax_price_impact_1','ctax_price_impact_2'])
 
-    # Zero out delta_price_yoy for sectors whose output was already 0 in year-1.
-    # model_class zeroes delta_price_yoy[year] for newly-dead sectors, but as a
-    # safety net we also suppress the price signal for any already-dead sector so
-    # that zero-fuel-use rows don't pick up a ghost substitution signal.
-    _dp_raw = self.V.read_var('delta_price_yoy', year-1)
-    _out_prev_for_dp = self.V.read_var('output', year-1)
-    _dp_raw[_out_prev_for_dp == 0] = 0.0
+    # prior-year applied emission cost per flow, for the tax-incidence ratchet in ener_balance.py::tax_incidence_loop
+    if year == self.model_start:
+        prev_emission_cost = pd.DataFrame(columns=['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','emission_cost'])
+    else:
+        prev_emission_cost = pd.concat([
+            self.V.read_var_df('emission_cost_intermediates', year-1),
+            self.V.read_var_df('emission_cost_hh', year-1).assign(PROD_COMM='FD_1'),
+            self.V.read_var_df('emission_cost_fcf', year-1).assign(PROD_COMM='FD_4'),
+            self.V.read_var_df('emission_cost_gov', year-1).assign(PROD_COMM='FD_3'),
+        ])[['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','emission_cost']].astype({'PROD_COMM':'str','TRAD_COMM':'int'})
 
     Energy_emissions.load_dynamic({
         'price_index': self.V.read_var('price_index', year-1, as_df=True),
+        'price_index_prev': self.V.read_var('price_index', year-2, as_df=True),
+        'prev_emission_cost': prev_emission_cost,
         'other_vars': DYNAMIC['other_country_vars'],
-        'delta_price_yoy': MRIO_vec_to_df_DEF(_dp_raw, 'dp'),
+        'delta_price_yoy': MRIO_vec_to_df_DEF(self.V.read_var('delta_price_yoy', year-1), 'dp'),
         'carbon_content': DYNAMIC['carbon_content'],
         'carbon_content_process': DYNAMIC['carbon_content_process'],
         'fuel_price': DYNAMIC['fuel_price'],
@@ -360,7 +463,9 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
     ener_base_fd = ener_base_fd.rename(columns={'PROD_COMM': 'FD'})
     self.V.write_var_df('energy_flows_fd', year, ener_base_fd)
 
-    if year > self.model_start:
+    # fuel substitution is inactive before fuel_substitution_start (default model_start+1)
+    # so that transitory shocks (COVID 2020) cannot ratchet into the energy IO coefficients
+    if year > self.model_start and year >= self.fuel_substitution_start:
         Energy_emissions.calc_energy_efficiency(self.V.read_var_df('energy_flows', year), self.V.read_var("output", year-1, as_df=True).rename(columns={'output':'q_base'}))
         ener_change = Energy_emissions.calc_fuel_substitution(
             self.V.read_var_df('energy_flows', year),
@@ -383,7 +488,18 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
 
     else:
         dq_tech_eff = np.zeros((len(EXOG_VARS.R)*len(EXOG_VARS.P)))
-        ind_energy = EXOG_VARS.IND_BASE.rename(columns={'z_bp':'z_bp_ener'})
+        if year > self.model_start:
+            # substitution gated off by fuel_substitution_start: neutral pass-through with the
+            # same shape/dtypes as calc_monetary_io_change's output. For year > model_start
+            # IND_BASE comes from new_IO whose keys are categorical, and passing those through
+            # crashes the fillna(0) in Price_model.calc_dp_pre_trade_bta.
+            ind_energy = EXOG_VARS.IND_BASE.reset_index()
+            ind_energy = ind_energy.astype({'REG_imp':'str','REG_exp':'str','PROD_COMM':'int','TRAD_COMM':'int'})
+            ind_energy['z_bp_ener'] = ind_energy['z_bp']
+            ind_energy['IO_coef_ener'] = ind_energy['z_bp_ener'] / ind_energy['output']
+            ind_energy = ind_energy.set_index(['REG_imp','REG_exp','PROD_COMM','TRAD_COMM'])[['z_bp_ener','IO_coef_ener']]
+        else:
+            ind_energy = EXOG_VARS.IND_BASE.rename(columns={'z_bp':'z_bp_ener'})
     self.V.write_var("dq_tech_eff", year, dq_tech_eff)
         
     tax_incidence = Energy_emissions.calculate_tax_incidence()
@@ -395,12 +511,17 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         'gov':           tax_incidence['tax_incidence_gov'],
     }
 
+    # diagnostics: flows where the tax-incidence ratchet (ener_balance.py::tax_incidence_loop) limits
+    # the applied ctax below the intended (uncapped) rate; intermediates only (FD rows have no PROD_COMM dim)
+    ctax_ratchet_diag = tax_incidence['ctax_ratchet_diag']
+    ctax_ratchet_diag = ctax_ratchet_diag[~ctax_ratchet_diag['PROD_COMM'].astype(str).str.contains("FD")].astype({'PROD_COMM':'int'})
+    self.V.write_var_df('ctax_ratchet_diag', year, ctax_ratchet_diag)
+
     flow_price_impact_intermediates = tax_incidence['flow_price_impact_intermediates']
     flow_price_impact_hh = tax_incidence['flow_price_impact_hh']
-    flow_price_impact_hh.loc[flow_price_impact_hh['flow_price_impact_hh']> 5, 'flow_price_impact_hh'] = 5.0
 
     self.V.write_var('flow_price_impact_intermediates', year, flow_price_impact_intermediates, from_df=True)
-    self.V.write_var('flow_price_impact_hh', year, flow_price_impact_hh, from_df=True)
+    self.V.write_var('flow_price_impact_hh', year, flow_price_impact_hh.drop(columns=['PROD_COMM']), from_df=True)
 
     BTA_cou = BTA(Scenario, self.bta, EXOG_VARS.R, self.temp, EXOG_VARS)
     if year > self.model_start:
@@ -470,9 +591,20 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
 
     # Calculate revenue recycled into different schemes (base and after energy elasticities)
     if year > self.model_start:
+        # ! per-region inflation factor (most recent observed CPI change) used to
+        # ! express last year's nominal revenue at current prices before differencing;
+        # ! cpi(year) is not available yet at this point, so cpi(y-1)/cpi(y-2) is
+        # ! the best proxy (consistent with the lagged-CPI convention in the HH module)
+        recyc_infl = self.V.read_var('cpi', year-1, as_df=True).rename(columns={'cpi': 'cpi_cur'})\
+            .merge(self.V.read_var('cpi', year-2, as_df=True).rename(columns={'cpi': 'cpi_prev'}),
+                   how='left', on='REG_imp')
+        recyc_infl['infl'] = np.where(recyc_infl['cpi_prev'] > 0,
+                                      recyc_infl['cpi_cur'] / recyc_infl['cpi_prev'], 1.0)
+        recyc_infl = recyc_infl[['REG_imp', 'infl']]
+
         recyc_rev_base = Tax_rev.calc_recyc_rev(tax_rev, rev_split)
         DYNAMIC['carbon_tax_revenues'][year] = recyc_rev_base.copy()
-        recyc_rev_base = Tax_rev.subtract_prev(recyc_rev_base, DYNAMIC['carbon_tax_revenues'][year-1])
+        recyc_rev_base = Tax_rev.subtract_prev(recyc_rev_base, DYNAMIC['carbon_tax_revenues'][year-1], infl=recyc_infl)
     else:
         recyc_rev_base = Tax_rev.calc_recyc_rev(tax_rev, rev_split)
         DYNAMIC['carbon_tax_revenues'][year] = recyc_rev_base.copy()
@@ -554,7 +686,10 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
     else:
         Prod_cost.calc_initial()
 
-    Empl_model = empl(EXOG_VARS, self.cost_curve_employment)
+    if self.cost_curve_run:
+        Empl_model = empl(EXOG_VARS, self.cost_curve_employment)
+    else:
+        Empl_model = empl(EXOG_VARS)
 
     if year == self.model_start:
         employment_base = Empl_model.calc_initial()
@@ -593,17 +728,26 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
     Price_model.calc_positive_and_negative_L()
 
     # ! carbon price, only intermediates!
+    if year > self.model_start:
+        # ! sectoral inflation factor (price_index(y-1)/price_index(y-2)): express last
+        # ! year's nominal cost at current prices before differencing, otherwise the pure
+        # ! inflation component enters as a spurious real cost increase every year;
+        # ! price_index is zeroed for dead sectors, hence the guarded divide
+        _pi_cur = self.V.read_var('price_index', year-1)
+        _pi_prev = self.V.read_var('price_index', year-2)
+        sec_infl = np.divide(_pi_cur, _pi_prev, out=np.ones_like(_pi_cur), where=_pi_prev > 0)
+
     if year == self.model_start:
         emission_cost = emission_cost_dfs['intermediates'].groupby(['REG_imp','PROD_COMM']).agg({'emission_cost':'sum'}).reset_index()
+        v_emission_cost = MRIO_df_to_vec_DEF(emission_cost, 'emission_cost')
     else:
         emission_cost = emission_cost_dfs['intermediates'].groupby(['REG_imp','PROD_COMM']).agg({'emission_cost':'sum'}).reset_index()
         emission_cost_prev = self.V.read_var_df('emission_cost_intermediates', year-1).groupby(['REG_imp','PROD_COMM']).agg({'emission_cost':'sum'}).reset_index()
-        emission_cost = emission_cost.merge(emission_cost_prev.rename(columns={'emission_cost':'prev'}), how='outer').fillna(0)
-        emission_cost['emission_cost'] = emission_cost['emission_cost'] - emission_cost['prev']
-        emission_cost = emission_cost.drop(columns=['prev'])
-    v_ctax = Prod_cost.calc_prod_cost_impact(MRIO_df_to_vec_DEF(emission_cost, 'emission_cost'))
+        v_emission_cost = MRIO_df_to_vec_DEF(emission_cost, 'emission_cost') \
+            - MRIO_df_to_vec_DEF(emission_cost_prev, 'emission_cost') * sec_infl
+    v_ctax = Prod_cost.calc_prod_cost_impact(v_emission_cost)
     # ! limit ctax to 300% price increase
-    v_ctax[v_ctax > 3.0] = 3.0
+    # v_ctax[v_ctax > 3.0] = 3.0
     ctax_effect = Price_model.second_order_dprice(v_ctax, direct_impact="passthrough")
     dp_ctax = ctax_effect['dp_full']
     v_ctax = ctax_effect['v_calculated']
@@ -660,13 +804,17 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         profit_rate_mean_L1 = profit_rate_mean_L1.merge(depr_rate, how='left', on=['REG_imp','PROD_COMM'])
 
         profit_rate_mean_L1['profit_rate_min'] = profit_rate_mean_L1['interest_rate'] * (1 + profit_rate_mean_L1['depreciation_rate'] * profit_rate_mean_L1['capital_stock']/profit_rate_mean_L1['output']) / (1 + profit_rate_mean_L1['interest_rate'])
+
         profit_rate_mean_L1.loc[profit_rate_mean_L1['profit_rate_min'] > 0.95, 'profit_rate_min'] = 0.95
         self.V.write_var("profit_rate_min", year, profit_rate_mean_L1[['PROD_COMM','REG_imp','profit_rate_min']], from_df=True)
 
-        # ! only works with 120 sectors now
-        sel = (profit_rate_mean_L1['profit_rate'] < profit_rate_mean_L1['profit_rate_min']) & (~(profit_rate_mean_L1['PROD_COMM'].isin([115,116,117,118])))
+        # ! we don't want to have profit rate condition on public sectors
+        public_sectors = [52,53,54]
+        # ! TEMPORARY for TJK - no INFLATION target set
+        sel = (profit_rate_mean_L1['profit_rate'] < profit_rate_mean_L1['profit_rate_min']) & (~(profit_rate_mean_L1['PROD_COMM'].isin(public_sectors)))
         profit_rate_mean_L1.loc[sel, 'profit_rate'] = profit_rate_mean_L1['profit_rate_min']
         profit_rate_mean_L1 = profit_rate_mean_L1['profit_rate'].values
+
     dev_profit_rate_L1 = np.nan_to_num(profit_rate_L1 - profit_rate_mean_L1)
     
     dev_profit_rate_L1[abs(dev_profit_rate_L1)==np.inf] = 0.0
@@ -706,7 +854,7 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
     # ! calculate labor changes here(!!!)
     if year > self.model_start and self.SWITCH_WITHIN_YEAR_LOOP:
         dlabor_sec = Inc_model.recalc_labor_comp_delta()
-        dlabor_sec = dlabor_sec.rename(columns={'glabor':'dlabor'})
+        dlabor_sec = dlabor_sec.rename(columns={'glabor':'dlabor'}).drop(columns=['glabor_cpi'])
         dlabor_nat = dlabor_sec.groupby(["REG_imp"])["dlabor"].sum()
 
         # ! add labor cost impacts
@@ -732,13 +880,14 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
 
     if year == self.model_start:
         cbam_cost = cbam_cost_dfs['intermediates'].groupby(['REG_imp','PROD_COMM']).agg({'cbam_cost':'sum'}).reset_index()
+        v_cbam_cost = MRIO_df_to_vec_DEF(cbam_cost, 'cbam_cost')
     else:
         cbam_cost = cbam_cost_dfs['intermediates'].groupby(['REG_imp','PROD_COMM']).agg({'cbam_cost':'sum'}).reset_index()
         cbam_cost_prev = self.V.read_var_df('cbam_cost_intermediates', year-1).groupby(['REG_imp','PROD_COMM']).agg({'cbam_cost':'sum'}).reset_index()
-        cbam_cost = cbam_cost.merge(cbam_cost_prev.rename(columns={'cbam_cost':'prev'}), how='outer').fillna(0)
-        cbam_cost['cbam_cost'] = cbam_cost['cbam_cost'] - cbam_cost['prev']
-        cbam_cost = cbam_cost.drop(columns=['prev'])
-    v_cbam = Prod_cost.calc_prod_cost_impact(MRIO_df_to_vec_DEF(cbam_cost, 'cbam_cost'))
+        # ! real-terms differencing, same sec_infl as for the carbon price above
+        v_cbam_cost = MRIO_df_to_vec_DEF(cbam_cost, 'cbam_cost') \
+            - MRIO_df_to_vec_DEF(cbam_cost_prev, 'cbam_cost') * sec_infl
+    v_cbam = Prod_cost.calc_prod_cost_impact(v_cbam_cost)
     # ! limit ctax to 300% price increase
     v_cbam[v_cbam > 3.0] = 3.0
     v_cbam[v_cbam < -3.0] = -3.0
@@ -758,13 +907,26 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
 
     # v_all = v_labor + v_tax + v_dev_normal_output + v_exog
     v_all = v_exog + v_ctax + v_dev_normal_output + v_labor + v_dev_profit_rate + v_output_growth + v_cbam + v_scarcity_rent
+    # ! exog-price sectors: drop all endogenous direct impacts, keep only v_exog
+    v_all[exog_price_mask] = v_exog[exog_price_mask]
+    # ! exog-cprice sectors (subset of exog_price_mask): keep carbon-tax pass-through
+    v_all[exog_cprice_mask] = v_exog[exog_cprice_mask] + v_ctax[exog_cprice_mask]
+    v_cbam[exog_price_mask] = 0.0
     v_wo_cbam = v_all - v_cbam
+    #! DISABLED for now: + v_scarcity_rent
 
     dp_pre_trade = Price_model.second_order_dprice(v_all)['dp_full']
     self.V.write_var("v_all", year, v_all)
 
     dp_no_cbam = Price_model.second_order_dprice(v_wo_cbam)['dp_full']
-    
+    # ! exog-price sectors: also remove received second-order effects,
+    # ! their price change is exactly the exogenous one
+    dp_pre_trade[exog_price_mask] = v_exog[exog_price_mask]
+    dp_no_cbam[exog_price_mask] = v_exog[exog_price_mask]
+    # ! exog-cprice sectors: restore carbon-tax pass-through on the received price too
+    dp_pre_trade[exog_cprice_mask] = v_exog[exog_cprice_mask] + v_ctax[exog_cprice_mask]
+    dp_no_cbam[exog_cprice_mask] = v_exog[exog_cprice_mask] + v_ctax[exog_cprice_mask]
+
     price_change_pre_trade = Price_model.calc_dp_pre_trade_bta(
         MRIO_vec_to_df_DEF(dp_no_cbam,'delta_p').rename(columns={'PROD_COMM':'TRAD_COMM','REG_imp':'REG_exp'}),
         cbam_cost_dfs['intermediates'], ind_energy, self.V.read_var('price_index', year-1, as_df=True))
@@ -787,36 +949,46 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         HH_model.HH = self.V.read_var('household_consumption', year-1, as_df=True).rename(columns={'household_consumption':'VIPA'}).set_index(['REG_imp','REG_exp','TRAD_COMM'])
 
     HH_model.load_dynamic({
-        'wage_base': self.V.read_var('wage', year, as_df=True),
-        'employment_base': self.V.read_var("employment_base", year, as_df=True),
+        'wage_base': self.V.read_var('wage', year-1, as_df=True),
+        'employment_base': self.V.read_var("employment_base", year-1, as_df=True),
         'cpi': self.V.read_var('cpi', year-1, as_df=True),
-        'save_rate1': self.V.read_var('save_rate', year-1, as_df=True),
-        'save_rate2': self.V.read_var('save_rate', year-2, as_df=True),
-        'save_rate3': self.V.read_var('save_rate', year-3, as_df=True),
+        # ! build the trailing benchmark from real_income_hh/real_spend_hh -- the exact
+        # ! quantities endog_save is computed from in household.py -- rather than the
+        # ! compensation-only save_rate proxy. real_spend_hh is captured pre-windfall
+        # ! inside calc_hh_demand_change, so this is ex-windfall by construction too,
+        # ! without needing the separate back-out done for save_rate_ex_windfall.
+        'save_rate1': _hh_save_rate_from_real_income(self.V, year-1),
+        'save_rate2': _hh_save_rate_from_real_income(self.V, year-2),
+        'save_rate3': _hh_save_rate_from_real_income(self.V, year-3),
         'hh_exog': Scenario.hh_exog
     })
 
     if year > self.model_start:
-        HH_price = HH_model.build_hh_price(price_change_pre_trade, emission_cost_dfs['hh'], self.V.read_var('price_index', year-1, as_df=True), prev=self.V.read_var_df('emission_cost_hh', year-1), year=year)
+        HH_price, HH_ctax = HH_model.build_hh_price(price_change_pre_trade, emission_cost_dfs['hh'], self.V.read_var('price_index', year-1, as_df=True), prev=self.V.read_var_df('hh_ctax_rate', year-1), year=year)
     else:
-        HH_price = HH_model.build_hh_price(price_change_pre_trade, emission_cost_dfs['hh'], self.V.read_var('price_index', year-1, as_df=True))
+        HH_price, HH_ctax = HH_model.build_hh_price(price_change_pre_trade, emission_cost_dfs['hh'], self.V.read_var('price_index', year-1, as_df=True))
+    self.V.write_var_df("hh_ctax_rate", year, HH_ctax)
     # TODO this is a biggie: we need to make sure that all DATA complies to a given set of typing
     # TODO TRAD_COMM should be int16; PROD_COMM str; REG_exp and REG_imp str
     HH_price = HH_price.astype({'TRAD_COMM':'int'})
 
     # add growth effect (income) is year > year[0]
-    HH_price_eff, HH_inc_eff, HH_save_eff = HH_model.calc_hh_demand_change(HH_price, recyc_rev_base, Scenario.inc_exog, self.V.read_var('inc_exog', year-1, as_df=True).rename(columns={'inc_exog':'dlabor_exog'}), year=year)
-    if year > self.model_start:
-        if year == self.years[1]:
-            HH_tech_substitution = Energy_emissions.hh_fuel_substitution(ener_base, self.V.read_var('household_consumption', year-1, as_df=True).rename(columns={'household_consumption':'VIPA'}).set_index(['REG_imp','REG_exp','TRAD_COMM']), self.V.read_var('household_consumption', year-1, as_df=True).rename(columns={'household_consumption':'VIPA'}).set_index(['REG_imp','REG_exp','TRAD_COMM']), DYNAMIC['HH_price'][year-1])
-        if year > self.years[1]:
-            HH_tech_substitution = Energy_emissions.hh_fuel_substitution(ener_base, self.V.read_var('household_consumption', year-1, as_df=True).rename(columns={'household_consumption':'VIPA'}).set_index(['REG_imp','REG_exp','TRAD_COMM']), self.V.read_var('household_consumption', year-2, as_df=True).rename(columns={'household_consumption':'VIPA'}).set_index(['REG_imp','REG_exp','TRAD_COMM']), DYNAMIC['HH_price'][year-1])
+    # ! Use DYNAMIC['inc_exog'][year] (which includes remittance injection) rather than
+    # ! Scenario.inc_exog (which is the raw scenario data without remittances)
+    HH_price_eff, HH_inc_eff, HH_save_eff, HH_delta_inc_rel, HH_real_income_diag, HH_real_spend_diag = HH_model.calc_hh_demand_change(HH_price, recyc_rev_base, self.V.read_var('inc_exog', year, as_df=True).rename(columns={'inc_exog':'dlabor_exog'}),self.V.read_var('inc_exog', year-1, as_df=True).rename(columns={'inc_exog':'dlabor_exog'}), year=year)
+    self.V.write_var('real_income_hh', year, HH_real_income_diag, from_df=True)
+    self.V.write_var('real_spend_hh', year, HH_real_spend_diag, from_df=True)
+
+    # household fuel substitution gated the same way as the intermediate channel above
+    if year > self.model_start and year >= self.fuel_substitution_start:
+        HH_tech_substitution = Energy_emissions.hh_fuel_substitution(ener_base, self.V.read_var('household_consumption', year-1, as_df=True).rename(columns={'household_consumption':'VIPA'}).set_index(['REG_imp','REG_exp','TRAD_COMM']), DYNAMIC['HH_price'][year-1], DYNAMIC['HH_delta_inc_rel'][year-1])
     else:
         HH_tech_substitution = pd.DataFrame(columns=['REG_imp','REG_exp','TRAD_COMM','VIPA_imp'])
     
     dy_hh_price = IO_model.build_dy_hh(HH_price_eff, 'delta_y_price')
     dy_hh_inc = IO_model.build_dy_hh(HH_inc_eff, 'delta_y_inc')
     dy_hh_save = IO_model.build_dy_hh(HH_save_eff, 'delta_y_save')
+    
     dy_hh_tech_substitution = IO_model.build_dy_hh(HH_tech_substitution, 'VIPA_imp')
 
     if calibration_counter == 0:
@@ -918,6 +1090,8 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
 
     dq_hh_tech_substitution = IO_model.calc_dq_exog(dy_hh_tech_substitution)
     dq_calibration_residual = IO_model.calc_dq_exog(dy_calibration_residual)
+    self.V.write_var("dq_hh_tech_substitution",year,dq_hh_tech_substitution)
+    self.V.write_var("dq_calibration_residual",year,dq_calibration_residual)
 
     dq_gov_delta = IO_model.calc_dq_exog(dy_gov_delta)
     dq_gov_recyc = IO_model.calc_dq_gov(dy_gov_recyc)
@@ -926,6 +1100,18 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
 
     # Calculate price changes
     dp_all = Price_model.second_order_dprice(self.V.read_var('v_all', year))['dp_full']
+    # ! exog-price sectors: price change is exactly the exogenous one
+    dp_all[exog_price_mask] = v_exog[exog_price_mask]
+    # ! exog-cprice sectors: restore carbon-tax pass-through
+    dp_all[exog_cprice_mask] = v_exog[exog_cprice_mask] + v_ctax[exog_cprice_mask]
+    # CAP dp_all before iteration to prevent NaN cascade
+    n_floored = (dp_all < -0.99).sum()
+    if n_floored > 0:
+        print(f"    Price floor applied to {n_floored} sector(s) (dp_all < -99%)")
+    n_capped = (dp_all > 2.0).sum()
+    if n_capped > 0:
+        print(f"    Price ceiling applied to {n_capped} sector(s) (dp_all > +200%)")
+    dp_all = np.clip(dp_all, -0.99, 2.0)
     self.V.write_var("dp_all", year, dp_all)
 
     print("--- 2.2.10 Trade module: %s seconds ---" % round(time.time() - module_time, 1))
@@ -945,25 +1131,36 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
     dy_hh_exog_fd = MRIO_df_to_vec(Scenario.fd_exog.query("PROD_COMM == 'FD_1'"), 
                                                         'REG_exp', 'TRAD_COMM', 'dy', 
                                                         EXOG_VARS.R['Region_acronyms'].to_list(), EXOG_VARS.P['Lfd_Nr'].to_list())
+    # if year == 2022:
+        # import pdb; pdb.set_trace()
     dq_hh_exog_fd = IO_model.calc_dq_exog(dy_hh_exog_fd)
+    self.V.write_var('dq_hh_exog_fd', year, dq_hh_exog_fd)
     DYNAMIC['dq_exog_hh_prev'] = dq_hh_exog_fd
 
-    dy_hh_exog = MRIO_df_to_vec(Scenario.hh_exog, 
-                                                        'REG_exp', 'TRAD_COMM', 'dy', 
+    dy_hh_exog_vec2d = MRIO_df_to_vec(Scenario.hh_exog,
+                                                        'REG_exp', 'TRAD_COMM', 'dy',
                                                         EXOG_VARS.R['Region_acronyms'].to_list(), EXOG_VARS.P['Lfd_Nr'].to_list())
-    self.V.write_var('dy_hh_exog', year, dy_hh_exog)
-    dq_hh_exog = IO_model.calc_dq_exog(dy_hh_exog)
+    # dy_hh_exog is registered as a REG_imp x TRAD_COMM x REG_exp table (variables.xlsx),
+    # so it must be written via from_df=True rather than the 2D REG_exp x TRAD_COMM
+    # vector above, which write_var would silently mis-align against that 3D shape.
+    self.V.write_var('dy_hh_exog', year,
+                      Scenario.hh_exog.astype({'TRAD_COMM': 'int'}).rename(columns={'dy': 'dy_hh_exog'}),
+                      from_df=True)
+    dq_hh_exog = IO_model.calc_dq_exog(dy_hh_exog_vec2d)
+    self.V.write_var('dq_hh_exog', year, dq_hh_exog)
 
     dy_gov_exog_fd = MRIO_df_to_vec(Scenario.fd_exog.query("PROD_COMM == 'FD_3'"), 
                                                         'REG_exp', 'TRAD_COMM', 'dy', 
                                                         EXOG_VARS.R['Region_acronyms'].to_list(), EXOG_VARS.P['Lfd_Nr'].to_list())
     dq_gov_exog_fd = IO_model.calc_dq_exog(dy_gov_exog_fd)
+    self.V.write_var('dq_gov_exog_fd', year, dq_gov_exog_fd)
     DYNAMIC['dq_exog_gov_prev'] = dq_gov_exog_fd
     
     dy_fcf_exog_fd = MRIO_df_to_vec(Scenario.fd_exog.query("PROD_COMM == 'FD_4'"), 
                                                         'REG_exp', 'TRAD_COMM', 'dy', 
                                                         EXOG_VARS.R['Region_acronyms'].to_list(), EXOG_VARS.P['Lfd_Nr'].to_list())
     dq_fcf_exog_fd = IO_model.calc_dq_exog(dy_fcf_exog_fd)
+    self.V.write_var('dq_fcf_exog_fd', year, dq_fcf_exog_fd)
     DYNAMIC['dq_exog_fcf_prev'] = dq_fcf_exog_fd
 
     print("--- 2.2.11 Exogenous demand: %s seconds ---" % round(time.time() - module_time, 1))
@@ -983,12 +1180,14 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
     # Introduce supply constraints
     supply_constraint = IO_model.calc_dq_supply_constraint3(Scenario.supply_constraint)
     dq_supply_constraint = supply_constraint['dq_supply_constraint']
+    self.V.write_var("dq_supply_constraint", year, dq_supply_constraint)
     # ! FEEDBACK from supply constraint to consumption is missing
     # ! i.e. y0 is not changing as it should 
     # TODO y0 is not changing
 
     supply_constraint_no_empl = IO_model.calc_dq_supply_constraint(Scenario.supply_constraint_no_empl_change)
     dq_supply_constraint_no_empl = supply_constraint_no_empl['dq_supply_constraint']
+    self.V.write_var("dq_supply_constraint_no_empl", year, dq_supply_constraint_no_empl)
 
     print("--- 2.2.12 Supply constraints: %s seconds ---" % round(time.time() - module_time, 1))
 
@@ -1070,19 +1269,20 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         'cpi_prev1': self.V.read_var('cpi', year-2, as_df=True) if year > self.model_start else None
     })
 
-    Cost_curves = cost_curves(EXOG_VARS)
+    if self.cost_curve_run:
+        Cost_curves = cost_curves(EXOG_VARS)
 
-    if year == self.model_start:
-        pass
-    else:
-        Cost_curves.load_dynamic({
-            'q_base': self.V.read_var("output", self.model_start, as_df=True),
-            'q_current': self.V.read_var("output", year-1, as_df=True),
-            'q_prev': self.V.read_var("output", year-2, as_df=True),
-            'empty_io': self.V.retrieve_empty_table('energy_flows')
-        })
-        cost_curves_impact = Cost_curves.calc_cost_impact()
-        cost_curves_io = Cost_curves.build_io_change(cost_curves_impact)
+        if year == self.model_start:
+            pass
+        else:
+            Cost_curves.load_dynamic({
+                'q_base': self.V.read_var("output", self.model_start, as_df=True),
+                'q_current': self.V.read_var("output", year-1, as_df=True),
+                'q_prev': self.V.read_var("output", year-2, as_df=True),
+                'empty_io': self.V.retrieve_empty_table('energy_flows')
+            })
+            cost_curves_impact = Cost_curves.calc_cost_impact()
+            cost_curves_io = Cost_curves.build_io_change(cost_curves_impact)
 
     # Build employment model
     if year == self.model_start:
@@ -1101,9 +1301,14 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         # ! this has an effect on compensation!!! 
         dlabor_productivity = MRIO_vec_to_df_DEF(empl_new['d_labor'], 'dlabor_prod')
 
-        empl_costcurve = Empl_model.calc_dempl_perc(MRIO_df_to_vec_DEF(cost_curves_impact, "input_cost_change"))
-        dempl_costcurve = empl_costcurve['d_employment']
-        dlabor_costcurve = MRIO_vec_to_df_DEF(empl_costcurve['d_labor'], 'dlabor_costcurve')
+        if self.cost_curve_run:
+            empl_costcurve = Empl_model.calc_dempl_perc(MRIO_df_to_vec_DEF(cost_curves_impact, "input_cost_change"))
+            dempl_costcurve = empl_costcurve['d_employment']
+            dlabor_costcurve = MRIO_vec_to_df_DEF(empl_costcurve['d_labor'], 'dlabor_costcurve')
+        else:
+            empl_costcurve = pd.DataFrame()
+            dempl_costcurve = np.zeros_like(dempl_productivity)
+            dlabor_costcurve = pd.DataFrame(columns=['REG_imp','PROD_COMM','dlabor_costcurve'])
 
     # Calculate employment changes due to output changes
     dq_total_empl = (dq_trade_eff + dq_tech_eff + dq_hh_price + dq_hh_inc + dq_hh_save + dq_hh_exog + dq_gov_recyc + dq_gov_delta + dq_calibration_residual + 
@@ -1115,7 +1320,7 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
                 dq_structural_change + dq_supply_constraint_no_empl + dq_hh_tech_substitution)
     self.V.write_var("dq_total", year, dq_total)
 
-    dempl = Empl_model.calc_dempl({
+    dempl = Empl_model.calc_dempl_NEW({
         'total':                dq_total_empl,
         'tech_eff':             dq_tech_eff,
         'trade_eff':            dq_trade_eff,
@@ -1246,7 +1451,7 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         dq_hh_save_old = dq_hh_save.copy()
         dq_total_old = dq_total.copy()
 
-        if year > self.model_start:
+        if (self.cost_curve_run) and (year > self.model_start):
             cost_curves_impact_old = cost_curves_impact[['REG_imp','PROD_COMM','input_cost_change']].copy()
             cost_curves_impact_old = cost_curves_impact_old.rename(columns={'input_cost_change':'input_cost_change_old'})
 
@@ -1256,9 +1461,13 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         Energy_emissions.update_ind_base(A_trade, self.V.read_var("output", year-1) + self.V.read_var("dq_total", year))
         tax_incidence = Energy_emissions.calculate_tax_incidence()
         self.V.write_var_df('emission_cost_intermediates', year, tax_incidence['tax_incidence_intermediates'])
-        self.V.write_var_df('emission_cost_hh', year, tax_incidence['tax_incidence_hh'])
-        self.V.write_var_df('emission_cost_fcf', year, tax_incidence['tax_incidence_fcf'])
-        self.V.write_var_df('emission_cost_gov', year, tax_incidence['tax_incidence_gov'])
+        self.V.write_var_df('emission_cost_hh', year, tax_incidence['tax_incidence_hh'].drop(columns=['PROD_COMM']))
+        self.V.write_var_df('emission_cost_fcf', year, tax_incidence['tax_incidence_fcf'].drop(columns=['PROD_COMM']))
+        self.V.write_var_df('emission_cost_gov', year, tax_incidence['tax_incidence_gov'].drop(columns=['PROD_COMM']))
+
+        ctax_ratchet_diag = tax_incidence['ctax_ratchet_diag']
+        ctax_ratchet_diag = ctax_ratchet_diag[~ctax_ratchet_diag['PROD_COMM'].astype(str).str.contains("FD")].astype({'PROD_COMM':'int'})
+        self.V.write_var_df('ctax_ratchet_diag', year, ctax_ratchet_diag)
 
         cbam_incidence = BTA_cou.calc_cbam_incidence(ind_ener_glo, DYNAMIC['carbon_content'], EXOG_VARS.HH_BASE, EXOG_VARS.FCF_BASE, EXOG_VARS.GOV_BASE)
         # cbam incidence ['REG_imp','REG_exp','PROD_COMM','TRAD_COMM','cbam_cost']
@@ -1271,7 +1480,7 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         dtax_rev = Tax_rev.calc_tax_iter_cond(emission_cost_old, self.V.read_var_df('emission_cost_intermediates', year))
 
         # ? calculate cost curve sector changes
-        if year > self.model_start:
+        if (self.cost_curve_run) and (year > self.model_start):
             cost_curves_impact = Cost_curves.calc_cost_impact(dq=dq_total)
             cost_curves_impact = cost_curves_impact.merge(cost_curves_impact_old, how='left', on=['REG_imp','PROD_COMM']).fillna(0)
 
@@ -1317,11 +1526,18 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
             g_labor_comp = Inc_model.recalc_labor_comp_delta() # labor comp is always nominal
             dlabor_sec = dlabor_sec.merge(g_labor_comp, how='left', on=['REG_imp','PROD_COMM'])
             dlabor_sec = dlabor_sec.merge(dlabor_productivity, how='left', on=['REG_imp','PROD_COMM'])
-            dlabor_sec = dlabor_sec.merge(dlabor_costcurve, how='left', on=['REG_imp','PROD_COMM'])
+            dlabor_sec = dlabor_sec.merge(dlabor_costcurve, how='left', on=['REG_imp','PROD_COMM']).fillna(0)
             dlabor_sec['dlabor'] = dlabor_sec['dlabor'] + dlabor_sec['glabor'] + dlabor_sec['dlabor_prod'] + dlabor_sec['dlabor_costcurve']
-            dlabor_sec = dlabor_sec.drop(columns=['glabor','dlabor_prod','dlabor_costcurve'])
+            # ? dlabor_cpi: CPI-indexation slice of glabor only, carried separately so
+            # ? household.py can deflate it by cpi_d_wage instead of quasi_CPI
+            dlabor_sec['dlabor_cpi'] = dlabor_sec['glabor_cpi']
+            dlabor_sec = dlabor_sec.drop(columns=['glabor','glabor_cpi','dlabor_prod','dlabor_costcurve'])
 
         dlabor_nat = Inc_model.calc_labor_iter_cond(dlabor_sec, dlabor_nat)
+        # ? dlabor_cpi already captured in dlabor_nat above (for the household income-effect
+        # ? split); downstream uses of dlabor_sec (labor cost pass-through into prices) still
+        # ? expect exactly 3 positional columns, so drop it here
+        dlabor_sec = dlabor_sec[['REG_imp','PROD_COMM','dlabor']].copy()
         dlabor_sec.columns = ["REG_imp", "PROD_COMM", f"dlabor_{iter_run}"]
 
         #endregion
@@ -1356,7 +1572,8 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         if year > self.model_start:
             recyc_rev_base = Tax_rev.calc_recyc_rev(tax_rev, rev_split)
             DYNAMIC['carbon_tax_revenues'][year] = recyc_rev_base.copy()
-            recyc_rev_base = Tax_rev.subtract_prev(recyc_rev_base, DYNAMIC['carbon_tax_revenues'][year-1])
+            # ! real-terms differencing, same recyc_infl as in the first pass [2.2.5]
+            recyc_rev_base = Tax_rev.subtract_prev(recyc_rev_base, DYNAMIC['carbon_tax_revenues'][year-1], infl=recyc_infl)
         else:
             recyc_rev_base = Tax_rev.calc_recyc_rev(tax_rev, rev_split)
             DYNAMIC['carbon_tax_revenues'][year] = recyc_rev_base.copy()
@@ -1366,28 +1583,30 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         # ! carbon price
         if year == self.model_start:
             emission_cost = self.V.read_var_df('emission_cost_intermediates', year).groupby(['REG_imp','PROD_COMM']).agg({'emission_cost':'sum'}).reset_index()
+            v_emission_cost = MRIO_df_to_vec_DEF(emission_cost, 'emission_cost')
         else:
             emission_cost = self.V.read_var_df('emission_cost_intermediates', year).groupby(['REG_imp','PROD_COMM']).agg({'emission_cost':'sum'}).reset_index()
             emission_cost_prev = self.V.read_var_df('emission_cost_intermediates', year-1).groupby(['REG_imp','PROD_COMM']).agg({'emission_cost':'sum'}).reset_index()
-            emission_cost = emission_cost.merge(emission_cost_prev.rename(columns={'emission_cost':'prev'}), how='outer').fillna(0)
-            emission_cost['emission_cost'] = emission_cost['emission_cost'] - emission_cost['prev']
-            emission_cost = emission_cost.drop(columns=['prev'])
-        v_ctax = Prod_cost.calc_prod_cost_impact(MRIO_df_to_vec_DEF(emission_cost, 'emission_cost'))
+            # ! real-terms differencing, same sec_infl as in the first pass
+            v_emission_cost = MRIO_df_to_vec_DEF(emission_cost, 'emission_cost') \
+                - MRIO_df_to_vec_DEF(emission_cost_prev, 'emission_cost') * sec_infl
+        v_ctax = Prod_cost.calc_prod_cost_impact(v_emission_cost)
         # ! limit ctax to 300% price increase
-        v_ctax[v_ctax > 3.0] = 3.0
+        # v_ctax[v_ctax > 3.0] = 3.0
         ctax_effect = Price_model.second_order_dprice(v_ctax, direct_impact="passthrough")
         dp_ctax = ctax_effect['dp_full']
         v_ctax = ctax_effect['v_calculated']
 
         if year == self.model_start:
             cbam_cost = self.V.read_var_df('cbam_cost_intermediates', year).groupby(['REG_imp','PROD_COMM']).agg({'cbam_cost':'sum'}).reset_index()
+            v_cbam_cost = MRIO_df_to_vec_DEF(cbam_cost, 'cbam_cost')
         else:
             cbam_cost = self.V.read_var_df('cbam_cost_intermediates', year).groupby(['REG_imp','PROD_COMM']).agg({'cbam_cost':'sum'}).reset_index()
             cbam_cost_prev = self.V.read_var_df('cbam_cost_intermediates', year-1).groupby(['REG_imp','PROD_COMM']).agg({'cbam_cost':'sum'}).reset_index()
-            cbam_cost = cbam_cost.merge(cbam_cost_prev.rename(columns={'cbam_cost':'prev'}), how='outer').fillna(0)
-            cbam_cost['cbam_cost'] = cbam_cost['cbam_cost'] - cbam_cost['prev']
-            cbam_cost = cbam_cost.drop(columns=['prev'])
-        v_cbam = Prod_cost.calc_prod_cost_impact(MRIO_df_to_vec_DEF(cbam_cost, 'cbam_cost'))
+            # ! real-terms differencing, same sec_infl as in the first pass
+            v_cbam_cost = MRIO_df_to_vec_DEF(cbam_cost, 'cbam_cost') \
+                - MRIO_df_to_vec_DEF(cbam_cost_prev, 'cbam_cost') * sec_infl
+        v_cbam = Prod_cost.calc_prod_cost_impact(v_cbam_cost)
         # ! limit ctax to 300% price increase
         v_cbam[v_cbam > 3.0] = 3.0
         v_cbam[v_cbam < -3.0] = -3.0
@@ -1431,7 +1650,7 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         # ---> remove v_dev_normal_output + v_output_growth
         # TODO keep labour for now?
 
-        if year > self.model_start:
+        if (self.cost_curve_run) and (year > self.model_start):
             v_costcurve = MRIO_df_to_vec_DEF(cost_curves_impact, 'input_cost_change')
             # sectors to exclude from standard
             #! cost curve have to swallow labour for now
@@ -1475,6 +1694,11 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         v_costcurve[v_costcurve < -0.5] = -0.5
         v_labor[v_labor < -0.5] = -0.5
         v_all = v_exog + v_ctax + v_dev_normal_output + v_labor + v_dev_profit_rate + v_output_growth + v_cbam + v_scarcity_rent + v_costcurve
+        # ! exog-price sectors: drop all endogenous direct impacts, keep only v_exog
+        v_all[exog_price_mask] = v_exog[exog_price_mask]
+        # ! exog-cprice sectors (subset of exog_price_mask): keep carbon-tax pass-through
+        v_all[exog_cprice_mask] = v_exog[exog_cprice_mask] + v_ctax[exog_cprice_mask]
+        v_cbam[exog_price_mask] = 0.0
 
         self.V.write_var("v_ctax", year, v_ctax)
         self.V.write_var("v_dev_normal_output", year, v_dev_normal_output)
@@ -1492,6 +1716,13 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         self.V.write_var("v_all", year, v_all)
 
         dp_no_cbam = Price_model.second_order_dprice(v_wo_cbam)['dp_full']
+        # ! exog-price sectors: also remove received second-order effects,
+        # ! their price change is exactly the exogenous one
+        dp_pre_trade[exog_price_mask] = v_exog[exog_price_mask]
+        dp_no_cbam[exog_price_mask] = v_exog[exog_price_mask]
+        # ! exog-cprice sectors: restore carbon-tax pass-through on the received price too
+        dp_pre_trade[exog_cprice_mask] = v_exog[exog_cprice_mask] + v_ctax[exog_cprice_mask]
+        dp_no_cbam[exog_cprice_mask] = v_exog[exog_cprice_mask] + v_ctax[exog_cprice_mask]
 
         price_change_pre_trade = Price_model.calc_dp_pre_trade_bta(
             MRIO_vec_to_df_DEF(dp_no_cbam,'delta_p').rename(columns={'PROD_COMM':'TRAD_COMM','REG_imp':'REG_exp'}),
@@ -1506,17 +1737,23 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         #endregion
 
         if year > self.model_start:
-            HH_price = HH_model.build_hh_price(price_change_pre_trade, self.V.read_var_df('emission_cost_hh', year), self.V.read_var('price_index', year-1, as_df=True), prev=self.V.read_var_df('emission_cost_hh', year-1))
+            HH_price, HH_ctax = HH_model.build_hh_price(price_change_pre_trade, self.V.read_var_df('emission_cost_hh', year), self.V.read_var('price_index', year-1, as_df=True), prev=self.V.read_var_df('hh_ctax_rate', year-1))
         else:
-            HH_price = HH_model.build_hh_price(price_change_pre_trade, self.V.read_var_df('emission_cost_hh', year), self.V.read_var('price_index', year-1, as_df=True))
+            HH_price, HH_ctax = HH_model.build_hh_price(price_change_pre_trade, self.V.read_var_df('emission_cost_hh', year), self.V.read_var('price_index', year-1, as_df=True))
+        self.V.write_var_df("hh_ctax_rate", year, HH_ctax)
         HH_price = HH_price.astype({'TRAD_COMM':'int'})
         DYNAMIC['HH_price'][year] = HH_price
-        HH_price_eff, HH_inc_eff, HH_save_eff = HH_model.calc_hh_demand_change(HH_price, recyc_rev_base, Scenario.inc_exog, self.V.read_var('inc_exog', year-1, as_df=True).rename(columns={'inc_exog':'dlabor_exog'}), dlabor_inc_nat=dlabor_nat, year=year)
+        # ! Use DYNAMIC['inc_exog'][year] (includes remittance injection) not Scenario.inc_exog
+        HH_price_eff, HH_inc_eff, HH_save_eff, HH_delta_inc_rel, HH_real_income_diag, HH_real_spend_diag = HH_model.calc_hh_demand_change(HH_price, recyc_rev_base, self.V.read_var('inc_exog', year, as_df=True).rename(columns={'inc_exog':'dlabor_exog'}),
+                                                                               self.V.read_var('inc_exog', year-1, as_df=True).rename(columns={'inc_exog':'dlabor_exog'}), dlabor_inc_nat=dlabor_nat, cpi_d_wage=Inc_model.cpi_d, year=year)
+        DYNAMIC['HH_delta_inc_rel'][year] = HH_delta_inc_rel
+        self.V.write_var('real_income_hh', year, HH_real_income_diag, from_df=True)
+        self.V.write_var('real_spend_hh', year, HH_real_spend_diag, from_df=True)
 
         dy_hh_price = IO_model.build_dy_hh(HH_price_eff, 'delta_y_price')
         dy_hh_inc = IO_model.build_dy_hh(HH_inc_eff, 'delta_y_inc')
         dy_hh_save = IO_model.build_dy_hh(HH_save_eff, 'delta_y_save')
-
+        self.V.write_var("delta_y_save", year, HH_save_eff.reset_index(), from_df=True)
         #endregion
 
         #region 2.2.15.4_GOV_adjust [rgba(26,188,156,0.2)] 
@@ -1584,6 +1821,18 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         self.V.write_var("dq_gov_recyc", year, dq_gov_recyc)
 
         dp_all = Price_model.second_order_dprice(v_all)['dp_full']
+        # ! exog-price sectors: price change is exactly the exogenous one
+        dp_all[exog_price_mask] = v_exog[exog_price_mask]
+        # ! exog-cprice sectors: restore carbon-tax pass-through
+        dp_all[exog_cprice_mask] = v_exog[exog_cprice_mask] + v_ctax[exog_cprice_mask]
+        # CAP dp_all within iteration to prevent NaN cascade
+        n_floored = (dp_all < -0.99).sum()
+        if n_floored > 0:
+            print(f"    Price floor applied to {n_floored} sector(s) (dp_all < -99%)")
+        n_capped = (dp_all > 2.0).sum()
+        if n_capped > 0:
+            print(f"    Price ceiling applied to {n_capped} sector(s) (dp_all > +200%)")
+        dp_all = np.clip(dp_all, -0.99, 2.0)
         self.V.write_var("dp_all", year, dp_all)
         #endregion
 
@@ -1624,7 +1873,10 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         # add scenario based changes
         #! add cost curves to IO changes
         if year > self.model_start:
-            io_changes_ = pd.concat([io_changes, cost_curves_io], axis=0)
+            if self.cost_curve_run:
+                io_changes_ = pd.concat([io_changes, cost_curves_io], axis=0)
+            else:
+                io_changes_ = io_changes
         else:
             io_changes_ = io_changes
 
@@ -1646,7 +1898,7 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
                 dq_structural_change + dq_supply_constraint_no_empl + dq_hh_tech_substitution + dq_io_change)
         self.V.write_var("dq_total", year, dq_total)
         
-        dempl = Empl_model.calc_dempl({
+        dempl = Empl_model.calc_dempl_NEW({
             'total':                dq_total_empl,
             'tech_eff':             dq_tech_eff,
             'trade_eff':            dq_trade_eff,
@@ -1754,6 +2006,9 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         # dy_fcf_empl_LSC = fd_df[['REG_exp','REG_imp','TRAD_COMM','VIGA']].rename(columns={'VIGA':'dy_LSC'})
         # dy_gov_empl_LSC = fd_df[['REG_exp','REG_imp','TRAD_COMM','VDFA']].rename(columns={'VDFA':'dy_LSC'})
 
+        # dq_total = dq_total + dq_empl_labour_supply_constraint
+        # dempl_total = dempl_total + dempl_labour_supply_constraint
+
         # -----------------------------------------------------------------------------------------
         
         # dq_total_iter = pd.concat([dq_total_iter, pd.DataFrame(
@@ -1797,7 +2052,6 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
                     'dq_trade_eff': dq_trade_eff,
                     'dq_io_change': dq_io_change,
                     'empl_constraint': employment_constraint['dL'],
-                    'v_output_growth': v_output_growth}).to_csv("Temp\\iter{}-{}.csv".format(year, iter_run))
         else:
             price_cond = np.inf
         
@@ -1857,6 +2111,8 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         ('dempl_productivity',             dempl_productivity),
         ('dempl_costcurve',                dempl_costcurve),
         ('dempl_labour_supply_constraint', dempl_labour_supply_constraint),
+        ('dempl_hh_save',                  dempl_hh_save),
+        ('dempl_io_change',                dempl_io_change)
     ]:
         self.V.write_var(_name, year, _val)
 

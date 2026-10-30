@@ -33,7 +33,7 @@ class empl:
     calc_dempl
         Calculates changes in employment.
     """ 
-    def __init__(self, EXOG_VARS, exclude_sectors):
+    def __init__(self, EXOG_VARS, exclude_sectors=[]):
         # load the following:
         # q_base, capital_stock, PARAMETERS
         self.R = EXOG_VARS.R
@@ -325,7 +325,24 @@ class empl:
             'd_labor': empl_t0 * MRIO_df_to_vec(self.common['wage'], 'REG_imp', 'PROD_COMM', 'wage', self.R_list, self.P_list)
         }
     
+    def adjust_labor_productivity(self, adjustment):
+        # adjust emp multiplier due to productivity changes
+        self.labor_productivity = self.labor_productivity * adjustment
+        self.empl_multiplier = self.empl_multiplier * (1/adjustment)
+    
     def calc_dempl(self, dq):
+        if type(dq) != list:
+            dempl = self.empl_multiplier * dq 
+            return dempl
+        else:
+            dempl = {}
+            for i in range(len(dq)):
+                dempl_i = self.empl_multiplier * dq[i]
+                dempl[i] = dempl_i
+            return dempl.values()
+        
+
+    def calc_dempl_NEW(self, dq):
         # ! this is WITHIN year, i.e. K held constant, Q changes
         # because K is held constant in the within year case, therefore:
         # dQ = dq/q_base

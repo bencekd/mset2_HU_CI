@@ -243,3 +243,23 @@ class BTA:
         self.temp.write_to_csv(cbam_incidence_all, 'cbam_incidence_all')
 
         return cbam_incidence_all
+            
+    def calc_rev_subtract_exp_base(self, tax_rev_base):
+        rev_subtract_exp_base = tax_rev_base.copy()
+        rev_subtract_exp_base["rev_subtract_exp_base"] = 0
+        
+        rev_subtract_exp_base = rev_subtract_exp_base.loc[:,["rev_subtract_exp_base"]]
+        
+        self.rev_subtract_exp_base = rev_subtract_exp_base
+        
+        return self.rev_subtract_exp_base
+            
+    def calc_rev_subtract_exp(self, tax_rev):
+        rev_subtract_exp = tax_rev.copy()
+        rev_subtract_exp["rev_subtract_exp"] = 0
+        
+        rev_subtract_exp = rev_subtract_exp.loc[:,["rev_subtract_exp"]]
+        
+        self.rev_subtract_exp = rev_subtract_exp
+        
+        return self.rev_subtract_exp

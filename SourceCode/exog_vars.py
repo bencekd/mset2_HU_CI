@@ -129,8 +129,90 @@ class exog_vars:
         self.output = output
         self.POPULATION = pd.melt(self.POPULATION_PROJECTION, id_vars=['Lfd_Nr_agg','Agg_region'], var_name='year')
         self.POPULATION['year'] = pd.to_numeric(self.POPULATION['year'])
-        
+
+        # Load remittance parameters and exogenous data from single 'remittances' sheet
+        # Sheet has two sections:
+        #   1. Bilateral base flows: rows with 'remittance_base_USDk' populated (no 'year')
+        #   2. Exogenous data: rows with 'year' and 'remittance_pct_gdp' (remittance as % of
+        #      actual GDP from WDI).  Also contains 'remittance_actual_USDk' for reference.
+        #      The model uses remittance_pct_gdp × model_GDP to compute the exogenous
+        #      remittance level, rather than hardcoded absolute values.
+        try:
+            remit_path = os.path.join(self.IO_PATH, "GLORIA_template", "modelinputdata", "parameters_global.xlsx")
+            remit_raw = pd.read_excel(remit_path, sheet_name='remittances', header=None)
+
+            # Find base flows section (header row containing 'remittance_base_USDk')
+            base_header_idx = remit_raw[remit_raw.apply(
+                lambda r: r.astype(str).str.contains('remittance_base_USDk').any(), axis=1)].index
+            # Find exogenous section (header row containing 'remittance_pct_gdp')
+            # Fall back to old format ('remittance_actual_USDk') if new column not found
+            exog_header_idx = remit_raw[remit_raw.apply(
+                lambda r: r.astype(str).str.contains('remittance_pct_gdp').any(), axis=1)].index
+            if len(exog_header_idx) == 0:
+                # Legacy fallback: look for old-style overrides
+                exog_header_idx = remit_raw[remit_raw.apply(
+                    lambda r: r.astype(str).str.contains('remittance_actual_USDk').any(), axis=1)].index
+
+            if len(base_header_idx) > 0:
+                bh = base_header_idx[0]
+                # Read base flows: from header row to next section or end
+                end_base = exog_header_idx[0] - 2 if len(exog_header_idx) > 0 else len(remit_raw)
+                base_df = pd.read_excel(remit_path, sheet_name='remittances',
+                                        header=bh, nrows=end_base - bh)
+                # Keep only rows with valid source_country and numeric base
+                base_df = base_df.dropna(subset=['source_country', 'remittance_base_USDk'])
+                base_df = base_df[base_df['source_country'] != 'TOTAL']
+                self.REMITTANCE_PARAMS = base_df.reset_index(drop=True)
+                print(f"  Loaded {len(self.REMITTANCE_PARAMS)} remittance link(s)")
+            else:
+                self.REMITTANCE_PARAMS = pd.DataFrame(
+                    columns=['source_country','target_country','remittance_base_USDk','elasticity'])
+                print("  No remittance base flows found")
+
+            if len(exog_header_idx) > 0:
+                oh = exog_header_idx[0]
+                ovr_df = pd.read_excel(remit_path, sheet_name='remittances',
+                                       header=oh)
+                # New format: remittance_pct_gdp is the key column
+                if 'remittance_pct_gdp' in ovr_df.columns:
+                    ovr_df = ovr_df.dropna(subset=['year', 'remittance_pct_gdp'])
+                    self.REMITTANCE_EXOG = ovr_df.reset_index(drop=True)
+                    print(f"  Loaded {len(self.REMITTANCE_EXOG)} exogenous remittance year(s) "
+                          f"(pct-of-GDP format)")
+                    # Also populate REMITTANCE_OVERRIDES for backward compat (if actual values exist)
+                    if 'remittance_actual_USDk' in ovr_df.columns:
+                        self.REMITTANCE_OVERRIDES = ovr_df[
+                            ['year','source_country','target_country','remittance_actual_USDk']
+                        ].dropna(subset=['remittance_actual_USDk']).reset_index(drop=True)
+                    else:
+                        self.REMITTANCE_OVERRIDES = pd.DataFrame(
+                            columns=['year','source_country','target_country','remittance_actual_USDk'])
+                else:
+                    # Legacy format: absolute overrides only
+                    ovr_df = ovr_df.dropna(subset=['year', 'remittance_actual_USDk'])
+                    self.REMITTANCE_OVERRIDES = ovr_df.reset_index(drop=True)
+                    self.REMITTANCE_EXOG = pd.DataFrame()
+                    print(f"  Loaded {len(self.REMITTANCE_OVERRIDES)} remittance override(s) "
+                          f"(legacy absolute format)")
+            else:
+                self.REMITTANCE_OVERRIDES = pd.DataFrame(
+                    columns=['year','source_country','target_country','remittance_actual_USDk'])
+                self.REMITTANCE_EXOG = pd.DataFrame()
+                print("  No remittance exogenous data found")
+
+        except (FileNotFoundError, ValueError, KeyError) as e:
+            self.REMITTANCE_PARAMS = pd.DataFrame(
+                columns=['source_country','target_country','remittance_base_USDk','elasticity'])
+            self.REMITTANCE_OVERRIDES = pd.DataFrame(
+                columns=['year','source_country','target_country','remittance_actual_USDk'])
+            self.REMITTANCE_EXOG = pd.DataFrame()
+            print(f"  No remittance parameters found ({e})")
+
         print(f"--- Collected exogenous variables: {round(time.time() - start_time, 1)} s ---")
+    
+    def pop(self, key):
+        self.pop(key, None) #type:ignore
+        return True
     
     def set_multiyear(self):
         self.MULTIYEAR = True

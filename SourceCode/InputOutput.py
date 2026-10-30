@@ -133,18 +133,41 @@ class IO:
         # keep other values intact
 
         # ? consolidate io_change_data
-        io_change_data_ = io_change_data.groupby(['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','Type']).agg({'Value':'sum'}).reset_index()
+        # ! min_count=1 preserves NaN for all-NaN groups (years with no shock specified);
+        # ! plain 'sum' silently turns those into 0.0, which then overwrites baseline coefficients
+        io_change_data_ = io_change_data.groupby(['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','Type']).agg(
+            Value=('Value', lambda s: s.sum(min_count=1))).reset_index()
+
+        # ! pivot Type into separate columns instead of merging on it: if a cell has BOTH a
+        # ! 'rel' and a 'replace' row, merging with Type as a join key fans that one baseline
+        # ! row out into duplicates (one per Type), which double-counts it in IO_coef_col_total
+        # ! and breaks the set_index uniqueness a few steps later. Keeping Type as columns
+        # ! instead makes it a plain one-to-one merge, and lets us apply 'rel' first and then
+        # ! always let 'replace' overwrite on top of it, deterministically, per cell.
+        # ! same NaN-vs-0 trap as the groupby above, one step later: pivot_table's default
+        # ! aggfunc='sum' re-aggregates internally with skipna=True and no min_count, so an
+        # ! all-NaN cell (already a single NaN row after the groupby) collapses to 0.0 here
+        # ! instead of staying NaN - which made every 'replace' row fire with Value=0.0 in
+        # ! years the scenario sheet left blank ("no change"), zeroing the baseline IO
+        # ! coefficient from year 1 instead of only once the shock is meant to start.
+        io_change_wide = io_change_data_.pivot_table(
+            index=['REG_imp','PROD_COMM','REG_exp','TRAD_COMM'], columns='Type', values='Value',
+            aggfunc=lambda s: s.sum(min_count=1)
+        ).reset_index()
+        for col in ['rel', 'replace']:
+            if col not in io_change_wide.columns:
+                io_change_wide[col] = np.nan
 
         # do impact
-        sparse_matrix = sparse_matrix.merge(io_change_data_.astype({'TRAD_COMM':'int','PROD_COMM':'int'}),how='left', on=['REG_exp','TRAD_COMM','REG_imp','PROD_COMM'])
-        
-        # replace
-        sel = (~sparse_matrix['Value'].isna()) & (sparse_matrix['Type']=='replace')
-        sparse_matrix.loc[sel,'IO_coef_trade'] = sparse_matrix.loc[sel,'Value']
+        sparse_matrix = sparse_matrix.merge(io_change_wide.astype({'TRAD_COMM':'int','PROD_COMM':'int'}),how='left', on=['REG_exp','TRAD_COMM','REG_imp','PROD_COMM'])
 
-        # percentage
-        sel = (~sparse_matrix['Value'].isna()) & (sparse_matrix['Type']=='rel')
-        sparse_matrix.loc[sel,'IO_coef_trade'] = sparse_matrix.loc[sel, 'IO_coef_trade'] * (1 + sparse_matrix.loc[sel, 'Value'])
+        # percentage (applied first)
+        sel = ~sparse_matrix['rel'].isna()
+        sparse_matrix.loc[sel,'IO_coef_trade'] = sparse_matrix.loc[sel, 'IO_coef_trade'] * (1 + sparse_matrix.loc[sel, 'rel'])
+
+        # replace (always overwrites on top of 'rel', if both are present)
+        sel = ~sparse_matrix['replace'].isna()
+        sparse_matrix.loc[sel,'IO_coef_trade'] = sparse_matrix.loc[sel,'replace']
 
         # max IO_coef_trade per column
         sparse_matrix['IO_coef_col_total'] = sparse_matrix.groupby(['REG_imp','PROD_COMM'])['IO_coef_trade'].transform('sum')
@@ -154,7 +177,7 @@ class IO:
         mask = sparse_matrix['IO_coef_col_total'] > 0.97
         sparse_matrix.loc[mask, 'IO_coef_trade'] = sparse_matrix.loc[mask, 'IO_coef_trade'] * (0.97/sparse_matrix.loc[mask, 'IO_coef_col_total'])
 
-        sparse_matrix = sparse_matrix.drop(columns=['Value','Type','IO_coef_col_total'])
+        sparse_matrix = sparse_matrix.drop(columns=['rel','replace','IO_coef_col_total'])
         sparse_matrix = sparse_matrix.set_index(['REG_imp','PROD_COMM','REG_exp','TRAD_COMM'])
 
         return sparse_matrix
@@ -434,19 +457,23 @@ class IO:
         return self.dq_energy
     
     @timing_decorator
-    def build_dy_hh(self, HH_price_effect, variable_):
+    def build_dy_hh(self, HH_price_effect_, variable_):
         # Household demand change due to price changes
         y = pd.DataFrame(self.A_id)
         y["EXP_SEC"] = list(zip(y[0], y[1]))
         y = pd.DataFrame(y.loc[:,"EXP_SEC"])
         
-        HH_price_effect = HH_price_effect.reset_index(drop=False)
+        HH_price_effect = HH_price_effect_.reset_index(drop=False).copy()
 
         dy_hh = HH_price_effect.loc[:,["REG_exp","TRAD_COMM","REG_imp",variable_]]
         dy_hh["EXP_SEC"] = list(zip(dy_hh["REG_exp"], dy_hh["TRAD_COMM"]))
         dy_hh = dy_hh.loc[:,["EXP_SEC","REG_imp",variable_]]
-        dy_hh = dy_hh.pivot(index="EXP_SEC", columns="REG_imp",
-                            values=variable_)
+        try:
+            dy_hh = dy_hh.pivot(index="EXP_SEC", columns="REG_imp",
+                                values=variable_)
+        except ValueError:
+            print("dy_hh IO.py 448 error, multiple indices")
+            import pdb; pdb.set_trace()
         dy_hh = y.merge(dy_hh, how="left", on=["EXP_SEC"])
         dy_hh = pd.concat([y, dy_hh.sum(numeric_only=True,axis=1)], axis=1)
         
@@ -536,7 +563,6 @@ class IO:
         # dq_hh_inc = dy_inc_price x Leontief_new
         # ---> dq_hh_trade = y_hh0 x Leontief_new - y_hh0 x Leontief
 
-    # TODO get rid of this and replace with calc_dq_exog
     @timing_decorator
     def calc_dq_hh(self, dy_hh_price, dy_hh_inc, dy_hh_save):
 
@@ -559,7 +585,6 @@ class IO:
         
         return self.dq_hh_price, self.dq_hh_inc, self.dq_hh_save
     
-    # TODO get rid of this and replace with calc_dq_exog
     @timing_decorator
     def calc_dq_gov(self, dy_gov_recyc):
         self.q_gov_IO = np.dot(self.L_BASE, self.y_gov0)

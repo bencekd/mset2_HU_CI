@@ -28,8 +28,9 @@ class prod_cost:
         
     def prod_cost_impact(self, cost_shock):
 
-        # relative
-        cost_shock_ = cost_shock[cost_shock['Type'].str.contains("rel")].copy()
+        # relative ('rel') and fully exogenous ('exog') price rows both enter
+        # v_exog; 'exog' rows additionally mask their cell in initiate_modules
+        cost_shock_ = cost_shock[cost_shock['Type'].str.contains("rel|exog", na=False)].copy()
 
         cost_shock_ = cost_shock_.astype({'PROD_COMM':'int16'})
         cost_shock_['Value'] = cost_shock_['Value'].fillna(0)

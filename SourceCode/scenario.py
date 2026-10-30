@@ -341,6 +341,10 @@ class scenario:
 
         fd_initial = fd_initial.astype({'TRAD_COMM':'str'})
         fd_exog = fd_exog.merge(fd_initial, how='left', on=['REG_imp','REG_exp','TRAD_COMM','PROD_COMM'])
+        # ! a left-merge miss (an ALL-expanded combo with no matching base-period flow key
+        # ! at all, not just a zero one) leaves y0 as NaN here regardless of fd_initial's
+        # ! own fillna(0) above - fold that case into 0 too, same as set_exog_inv's dk_base
+        fd_exog['y0'] = fd_exog['y0'].fillna(0)
         fd_exog['dy'] = 0.0
 
         # assigned vars dict
@@ -370,7 +374,14 @@ class scenario:
 
         df_absb = fd_exog[fd_exog['Type'].str.contains('abs-b')].copy()
         # calculate share by line
-        df_absb['share'] = df_absb['y0'] / df_absb.groupby(['Line'])['y0'].transform('sum')
+        # ! if the line's y0 sum is zero (e.g. an 'ALL'-expanded cell with no base-year
+        # ! flow for that exporter/importer/product combo) spread the value equally
+        # ! across the line's cells instead of dropping it (0/0) - same fix as set_exog_inv's
+        # ! dk_base share (see electricity-exog-pathway fix)
+        line_base = df_absb.groupby(['Line'])['y0'].transform('sum')
+        df_absb['share'] = np.where(line_base > 0,
+                                    df_absb['y0'] / line_base,
+                                    1 / df_absb.groupby(['Line'])['Line'].transform('count'))
         df_absb['dy'] = df_absb['Value'] * df_absb['share']
 
         # ? rel-b
@@ -459,6 +470,16 @@ class scenario:
         except (ValueError, KeyError):
             inv_exog = pd.DataFrame(columns=columns_)
 
+        # read in power investment, if any
+        try:
+            power_inv_exog = pd.read_excel(self.scenario_file, sheet_name='Power investment', skiprows=13)
+            power_inv_exog = power_inv_exog[['Country ISO*','Sector investing code*', self.YEAR,'Type*']]
+            power_inv_exog.columns = columns_
+        except ValueError:
+            power_inv_exog = pd.DataFrame(columns=columns_)
+
+        inv_exog = pd.concat([inv_exog, power_inv_exog], axis=0)    
+
         inv_exog = inv_exog.rename(columns={self.YEAR:'Value'})
 
         # add index before resolving
@@ -487,10 +508,17 @@ class scenario:
         # ? if multiple specified from something, then spread out proportionally
 
         df_absb = inv_exog[inv_exog['Type'].str.contains('abs-b')].copy()
+        df_absb['PROD_COMM'] = df_absb['PROD_COMM'].astype(int)
         df_absb = df_absb.merge(investment_base, how='left', on=['REG_imp','PROD_COMM'])
+        df_absb['dk_base'] = df_absb['dk_base'].fillna(0)
         # calculate share by line
-        df_absb['dk'] = df_absb['Value']
-        df_absb['share'] = df_absb['dk_base'] / df_absb.groupby(['Line'])['dk_base'].transform('sum')
+        # ! if the line's dk_base sum is zero (e.g. sectors with an externally
+        # ! given investment pathway and zeroed base investment) spread the
+        # ! value equally across the line's cells instead of dropping it (0/0)
+        line_base = df_absb.groupby(['Line'])['dk_base'].transform('sum')
+        df_absb['share'] = np.where(line_base > 0,
+                                    df_absb['dk_base'] / line_base,
+                                    1 / df_absb.groupby(['Line'])['Line'].transform('count'))
         df_absb['dk'] = df_absb['Value'] * df_absb['share']
         df_absb = df_absb[['REG_imp','PROD_COMM','dk']].copy()
 
@@ -580,6 +608,54 @@ class scenario:
 
         self.ee_exog = ee_exog
 
+
+
+    
+    # ^ //////////////////////////////////////
+
+    # ^ -----------------------------------------------
+    # ^   Sheet: Power investment     
+    # ^ -----------------------------------------------
+    def set_ely_investment(self):
+        # columns to be passed on
+        columns_ = ['REG_imp', 'Region', 'PROD_COMM','Renewables', 'Value']
+        columns_empty =  ['REG_imp','PROD_COMM','TRAD_COMM', 'Value', 'Type']
+        try:
+            power_inv = pd.read_excel(self.scenario_file, sheet_name='Power investment', skiprows=13)
+            power_inv = power_inv[['Country ISO*', 'Country','Sector investing code*', 'Renewables*', self.YEAR]]
+            power_inv.columns = columns_
+        except ValueError:
+            power_inv = pd.DataFrame(columns=columns_empty)
+        
+        if(len(power_inv)>0):
+            # sum across renewables and calculate shares
+            # power_share = pd.read_excel(self.scenario_file, sheet_name='Power_investment', skiprows=14)
+            shares = power_inv.groupby(['REG_imp', 'Region', 'PROD_COMM','Renewables'], as_index=False).sum()
+            shares['share'] = shares['Value']/(shares['Value'].sum())
+            shares = shares[shares['share'] != 0]
+            
+            # Read in renewable investment converters
+            inv_renew=pd.read_csv(os.getcwd() + '/GLORIA_template/Investment/Inv_renewables.csv', index_col = 0)
+            inv_renew.index.name = 'TRAD_COMM'
+            # inv_renew = inv_renew.iloc[:,1:]
+            inv_renew_long = pd.melt(inv_renew.reset_index(), id_vars=['TRAD_COMM'], 
+                                          var_name='Renewables', 
+                                          value_name='value')
+            
+            # Merge shares and investment converter
+            merge_df = inv_renew_long.merge(shares,on=['Renewables'])
+            merge_df['new_share'] = merge_df['value'] * merge_df['share'] 
+            new_share = merge_df.groupby(['TRAD_COMM','REG_imp','PROD_COMM'], as_index=False).sum()
+            new_share = new_share[['REG_imp', 'PROD_COMM', 'TRAD_COMM', 'new_share']]
+            new_share.rename(columns={'TRAD_COMM':'TRAD_COMM', "new_share":"Value"}, inplace=True)
+            new_share = new_share[new_share['Value'] != 0.0]
+            # set type to replace
+            new_share['Type'] = 'replace'
+        else:
+            new_share = power_inv
+        return new_share
+    
+
     # ^ //////////////////////////////////////
 
     # ^ -----------------------------------------------
@@ -596,6 +672,9 @@ class scenario:
             inv_conv_adj.columns = columns_
         except (ValueError, KeyError):
             inv_conv_adj = pd.DataFrame(columns=columns_)
+
+        # Merge with power_investment shares
+        inv_conv_adj = pd.concat([inv_conv_adj, self.set_ely_investment()], axis=0)
 
         df_inv_conv = INV_CONV.copy()
 
@@ -761,8 +840,19 @@ class scenario:
             io_changes = resolve_comma(io_changes, 'TRAD_COMM')
             io_changes = resolve_comma(io_changes, 'PROD_COMM')
 
-            io_changes = resolve_all(io_changes, 'TRAD_COMM', [x for x in np.arange(1,121)])
-            
+            io_changes = resolve_all(io_changes, 'TRAD_COMM', [x for x in np.arange(1,57)])
+
+            # ! resolve_hyphen/resolve_comma cast TRAD_COMM/PROD_COMM to str after exploding,
+            # ! but resolve_all's 'ALL' expansion inserts plain ints without casting back - so a
+            # ! literal-value row (e.g. TRAD_COMM='34') and an ALL-sourced row touching the same
+            # ! sector (TRAD_COMM=34, int) end up as different dtypes for what should be the same
+            # ! key. Every downstream groupby/dedup on these columns (the ALL/KEEP resolution
+            # ! below, and the rel/replace consolidation further down) then fails to recognize
+            # ! them as the same cell, and InputOutput.io_change's int-cast at merge time turns
+            # ! that into a genuine duplicate key, fanning out the left-merge into duplicated
+            # ! sparse_matrix rows. Cast to a single dtype once, here, before any of that runs.
+            io_changes = io_changes.astype({'TRAD_COMM': 'int', 'PROD_COMM': 'int'})
+
             # Save inputs for Specific country
             io_changes_specific = io_changes[(io_changes['REG_exp']!='ALL') & (io_changes['REG_imp']!='ALL')].copy()
             # treatment of ALL in REG_exp
@@ -807,30 +897,191 @@ class scenario:
                 # now we need to recalculate the relevant shares
                 # complement_ALL is
                 # REG_exp, REG_imp, PROD_COMM, TRAD_COMM, Value
-                complement_ALL = complement_ALL.merge(self.IND_BASE[['REG_imp','REG_exp','PROD_COMM','TRAD_COMM','z_bp']], 
-                                     how='left', on=['REG_imp','REG_exp','PROD_COMM','TRAD_COMM'])
+                complement_ALL = complement_ALL.astype({'PROD_COMM': 'int16', 'TRAD_COMM': 'int16'})
+                complement_ALL = complement_ALL.merge(self.IND_BASE[['REG_imp','REG_exp','PROD_COMM','TRAD_COMM','z_bp']].astype({'PROD_COMM': 'int16', 'TRAD_COMM': 'int16'}),how='left', on=['REG_imp','REG_exp','PROD_COMM','TRAD_COMM'])
                 # calculate relevant share
                 complement_ALL['REG_exp_share'] = \
                     complement_ALL['z_bp'] / complement_ALL.groupby(['REG_imp','PROD_COMM','TRAD_COMM'])['z_bp'].transform('sum')
                 complement_ALL['Value'] = complement_ALL['Value'] * complement_ALL['REG_exp_share']
                 complement_ALL = complement_ALL.drop(columns=['z_bp','REG_exp_share'])
                 io_changes = pd.concat([io_changes[io_changes['REG_exp']!='KEEP'], complement_ALL])
+                io_changes = io_changes[~io_changes['Value'].isna()].copy()
 
                 del complement_ALL
 
-            # we might end up with duplicates, the latest assignment is the valid one
-            io_changes = io_changes.sort_values(by='line').drop_duplicates(keep='last', subset=['REG_imp','REG_exp','PROD_COMM','TRAD_COMM']).drop(columns=['line'])
-                
+            # ! we might end up with several rows per (REG_imp,REG_exp,PROD_COMM,TRAD_COMM) cell after
+            # ! the ALL/KEEP expansion above (e.g. combined scenarios stacking two single-effect
+            # ! sheets). Collapsing them all with drop_duplicates(keep='last') regardless of Type
+            # ! silently discarded whichever row wasn't last, even when it was a 'rel' shock that
+            # ! should combine with another 'rel' shock rather than lose to a 'replace' row (or vice
+            # ! versa). Mirror InputOutput.io_change()'s convention instead: sum same-cell 'rel'
+            # ! shocks (min_count=1 so an all-NaN group stays NaN rather than becoming a false 0),
+            # ! and keep-last dedupe 'replace' rows (still a deterministic overwrite, since summing
+            # ! absolute replacement values makes no sense) - keeping both Types as separate rows so
+            # ! io_change() can apply 'rel' first and 'replace' on top per its own logic.
+            key_cols = ['REG_imp','REG_exp','PROD_COMM','TRAD_COMM']
+
+            df_rel = (io_changes[io_changes['Type'] == 'rel']
+                      .groupby(key_cols, as_index=False)
+                      .agg(Value=('Value', lambda s: s.sum(min_count=1))))
+            df_rel['Type'] = 'rel'
+
+            df_replace = (io_changes[io_changes['Type'] == 'replace']
+                          .sort_values(by='line')
+                          .drop_duplicates(subset=key_cols, keep='last')[key_cols + ['Value','Type']])
+
+            io_changes = pd.concat([df_rel, df_replace], ignore_index=True)
+
         except (ValueError, KeyError):
             io_changes = pd.DataFrame(columns=['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','Type','Value'])
+            
+        # Bring in power sector IO changes
+        io_changes =  pd.concat([io_changes, self.set_power_io_changes()], axis=0)
         
         self.io_changes = io_changes
 
         return io_changes
+    
+    #%%
+    # ^ //////////////////////////////////////
+    
+    def set_power_io_changes(self):
+
+        columns_ = ['REG_imp', 'PROD_COMM', 'Technology', 'Value']
+        columns_empty =  ['REG_imp', 'REG_exp','PROD_COMM','TRAD_COMM', 'Value', 'Type']
+        
+        try:
+            power_generation = pd.read_excel(self.scenario_file, sheet_name="Power generation shares", skiprows=13)
+            power_generation = power_generation[['Country ISO*','Sector code*','Technology name*',self.YEAR]]
+            power_generation.columns = columns_
+        except ValueError:
+            power_generation = pd.DataFrame(columns=columns_empty)
+
+            
+        if(len(power_generation)>0):
+            # ! blank year-cells are explicit zeros (technology absent from the
+            # ! mix that year); left as NaN the instruction silently vanishes
+            # ! downstream instead of zeroing the coefficient
+            power_generation['Value'] = power_generation['Value'].fillna(0)
+
+            # io_power's column names are the canonical technology names
+            power_generation['Technology'] = power_generation['Technology'].replace(
+                {'Wind onshore': 'Wind', 'Wind offshore': 'Wind'})
+
+            # sum across renewables and calculate shares
+            # power_share = pd.read_excel(self.scenario_file, sheet_name='Power_investment', skiprows=14)
+            shares = power_generation.groupby(['REG_imp', 'PROD_COMM','Technology'], as_index=False).sum()
+            shares['share'] = shares['Value']/(shares.groupby(['REG_imp','PROD_COMM'])['Value'].transform('sum'))
+            # ! zero shares are KEPT: they must produce zero-replacements for
+            # ! the technology's input coefficients (e.g. coal exiting the mix);
+            # ! filtering them out froze the coefficient at its last nonzero
+            # ! value and let fuel use regrow with output
+            
+            # Read in renewable investment converters
+            io_power = pd.read_csv(os.getcwd() + '/GLORIA_template/Energy_emissions/power_generation_IO.csv', index_col = 0)
+            io_power.index.name = 'TRAD_COMM'
+            # inv_renew = inv_renew.iloc[:,1:]
+            io_power_long = pd.melt(io_power.reset_index(), id_vars=['TRAD_COMM'], 
+                                          var_name='Technology', 
+                                          value_name='value')
+            
+            unmatched_tech = set(shares['Technology'].dropna()) - set(io_power.columns)
+            if unmatched_tech:
+                print(f"WARNING set_power_io_changes: technologies {sorted(unmatched_tech)} "
+                      f"not found in power_generation_IO.csv - their shares carry no input structure")
+
+            # Merge shares and investment converter
+            merge_df = io_power_long.merge(shares,on=['Technology']).fillna(0)
+            merge_df['new_share'] = merge_df['value'] * merge_df['share']
+            io_changes = merge_df.groupby(['TRAD_COMM','REG_imp','PROD_COMM'], as_index=False).agg({'new_share':'sum'})
+            # ! zero-valued replacements are kept, but only for commodities that
+            # ! are actual inputs to at least one generation technology - there a
+            # ! zero IS the instruction (replace the coefficient with 0);
+            # ! commodities outside the power recipe get no row at all
+            power_input_comms = io_power.index[io_power.abs().sum(axis=1) > 0]
+            io_changes = io_changes[io_changes['TRAD_COMM'].isin(power_input_comms)]
+            io_changes = io_changes[['REG_imp', 'PROD_COMM', 'TRAD_COMM', 'new_share']]
+            io_changes.rename(columns={"new_share":"Value"}, inplace=True)
+
+            # ! spread each replacement across exporters by base trade shares
+            # ! (same logic as complement_ALL in set_io_changes): pinning it to
+            # ! REG_exp == REG_imp leaves imported fuel flows (e.g. UZB gas into
+            # ! TJK power) untouched by the generation pathway, and double-counts
+            # ! by assigning the full recipe to the domestic flow on top of them
+            base_flows = self.IND_BASE[['REG_imp','REG_exp','PROD_COMM','TRAD_COMM','z_bp']]\
+                .astype({'PROD_COMM': 'int16', 'TRAD_COMM': 'int16'})
+            io_changes = io_changes.astype({'PROD_COMM': 'int16', 'TRAD_COMM': 'int16'})\
+                .merge(base_flows, how='left', on=['REG_imp','PROD_COMM','TRAD_COMM'])
+            io_changes['REG_exp_share'] = \
+                io_changes['z_bp'] / io_changes.groupby(['REG_imp','PROD_COMM','TRAD_COMM'])['z_bp'].transform('sum')
+            io_changes['Value'] = io_changes['Value'] * io_changes['REG_exp_share']
+            io_changes = io_changes[~io_changes['Value'].isna()]
+            io_changes = io_changes[['REG_imp', 'REG_exp', 'PROD_COMM', 'TRAD_COMM', 'Value']]
+            # # ! ALWAYS rebalancing to 1 [column-wise | PROD_COMM]
+            # io_changes['new_Value'] = io_changes['Value'] * (1 / io_changes.groupby(['REG_imp','PROD_COMM'])['Value'].transform('sum'))
+            # io_changes = io_changes.fillna(0)
+            # io_changes['Value'] = io_changes['new_Value']
+            # io_changes = io_changes.drop(columns=['new_Value'])
+
+            
+            # set type to replace
+            io_changes['Type'] = 'replace'
+        else:
+            io_changes = power_generation
+        
+        if len(io_changes) > 0:
+
+            # index
+            io_changes['line'] = range(len(io_changes))
+    
+            # resolve hyphens
+            io_changes = resolve_hyphen(io_changes, 'TRAD_COMM')
+            io_changes = resolve_hyphen(io_changes, 'PROD_COMM')
+    
+            io_changes = resolve_comma(io_changes, 'TRAD_COMM')
+            io_changes = resolve_comma(io_changes, 'PROD_COMM')
+    
+            io_changes = resolve_all(io_changes, 'TRAD_COMM', [x for x in np.arange(1,57)])
+            
+            # # Save inputs for Specific country
+            # io_changes_specific = io_changes[(io_changes['REG_exp']!='ALL') & (io_changes['REG_imp']!='ALL')].copy()
+    
+            # # treatment identical for all REG_exp
+            # pairs = io_changes[['REG_imp','PROD_COMM','TRAD_COMM','Value','Type','line']].copy()
+            # if len(pairs) > 0:
+            #     pairs['key'] = 1
+            #     keys = pd.DataFrame({
+            #         'REG_exp': self.REGIONS['Region_acronyms'].to_list(),
+            #         'key': 1
+            #     })
+                
+            #     io_changes = keys.merge(pairs, how='left', on='key').drop(columns=['key'])
+    
+            #     # we might end up with duplicates, the latest assignment is the valid one
+            #     io_changes = io_changes.sort_values(by='line').drop_duplicates(keep='last', subset=['REG_imp','REG_exp','PROD_COMM','TRAD_COMM']).drop(columns=['line'])
+            io_changes = io_changes.drop(columns=['line'])
+
+            
+        self.power_io_changes = io_changes
+
+        return io_changes
+
+    
+#%%
 
     def build_rev_split(self):
         # load tax revenue split
-        rev_split = pd.read_excel(self.scenario_file, sheet_name="rev_split")
+        rev_split = self.scenario_data["rev_split"]
+        rev_split.reset_dimensions() # type: ignore
+        rev_split = pd.DataFrame(rev_split.values) # type: ignore
+        rev_split.columns = rev_split.iloc[0]
+        rev_split = rev_split.drop(index=0)
+        rev_split = rev_split.reset_index().drop(columns=["index"])
+        
+        for i in range(1,len(rev_split.columns)):
+            colname = rev_split.columns[i]
+            rev_split[colname] = pd.Series(rev_split[colname], dtype=float)
+
         self.rev_split = rev_split
 
         return self.rev_split

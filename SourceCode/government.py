@@ -95,20 +95,17 @@ class gov:
         delta_profit['delta_profit'] = delta_profit['delta_profit'] / delta_profit['profit_prev']
         delta_profit = delta_profit[['REG_imp','delta_profit']]
 
-        # Royalties (can only calculate with 120 sectors)
+        # Royalties
         # Fishing/mining/extractive sectors
-        # fishing [22, 23]
-        # mining [24, 40]
-        if(len(self.P) != 120):
-            os.system('color 4')
-            print("######################################################################################")
-            print("!!!! ERROR: Royalties can only be calculated with 120 sectors for now.")
-            print("######################################################################################")
-            print("Exiting.")
-            os.system('color')
-            quit() 
-        q_prev = self.MRIO_vec_to_df_DEF(q_prev, 'q_prev').query("PROD_COMM > 21 & PROD_COMM < 41")
-        q_curr = self.MRIO_vec_to_df_DEF(q, 'q').query("PROD_COMM > 21 & PROD_COMM < 41")
+        # For 120 sectors: fishing [22, 23], mining [24, 40]
+        # For 56 sectors: forestry/fishing [10], mining/extraction [11, 18]
+        if len(self.P) == 120:
+            royalty_filter = "PROD_COMM > 21 & PROD_COMM < 41"
+        else:
+            # Generalized: select sectors that are fishing, forestry, mining, extraction
+            royalty_filter = "PROD_COMM >= 10 & PROD_COMM <= 18"
+        q_prev = self.MRIO_vec_to_df_DEF(q_prev, 'q_prev').query(royalty_filter)
+        q_curr = self.MRIO_vec_to_df_DEF(q, 'q').query(royalty_filter)
         delta_royalties = self.MRIO_df_to_vec_DEF(q_curr, 'q') * (1+self.MRIO_df_to_vec_DEF(price_index, 'dp')) - self.MRIO_df_to_vec_DEF(q_prev, 'q_prev')
 
         delta_royalties = q_prev.merge(self.MRIO_vec_to_df_DEF(delta_royalties, "delta_royalties"))
@@ -175,8 +172,6 @@ class gov:
             gov_base = self.GOV.reset_index()
         else:
             gov_base = new_gov_base.copy()
-            gov_base['VIGA'] = gov_base['VIGA'] + gov_base['VIGA_dyn']
-            gov_base['VIGA'] = gov_base['VIGA'].apply(lambda x: x if x > 0.0 else 0.0) 
         
         gov_base = gov_base[['REG_exp','REG_imp','TRAD_COMM','VIGA']].copy()
 
@@ -184,7 +179,7 @@ class gov:
         consumption_shares = consumption_shares.merge(emission_cost_, how='left', on=['REG_exp','REG_imp','TRAD_COMM']).fillna(0)
         consumption_shares['VIGA_nominal'] = consumption_shares['VIGA'] * consumption_shares['price_index']
         consumption_shares['emission_cost'] = consumption_shares['emission_cost'] / consumption_shares['VIGA_nominal']
-        consumption_shares['emission_cost'] = consumption_shares['emission_cost'].apply(lambda x: 0 if x < 0 else (3.0 if x > 3.0 else x))
+        # consumption_shares['emission_cost'] = consumption_shares['emission_cost'].apply(lambda x: 0 if x < 0 else (3.0 if x > 3.0 else x))
         consumption_shares['price_index'] = consumption_shares['price_index'] + consumption_shares['emission_cost']
         consumption_shares['share'] = consumption_shares['VIGA'] / consumption_shares.groupby(['REG_imp'])['VIGA'].transform('sum')
 
@@ -195,6 +190,7 @@ class gov:
         government_spending['VIGA_const'] = government_spending['VIGA'] / government_spending['price_index']
         government_spending['VIGA_const_adj'] = government_spending['share'] * government_spending.groupby(['REG_imp'])['VIGA_const'].transform('sum')
 
+        # ? here the new part LHS [1] is only the revenue based spending; while [2] includes residual and potentially recycled revenues; 
         government_spending['VIGA'] = government_spending['VIGA_const_adj'] - government_spending['VIGA_old']
         # government spending is NOMINAL; we assume that the government is NOT price sensitive
 

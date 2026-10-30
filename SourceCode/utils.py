@@ -41,10 +41,15 @@ class temporary_storage:
 
 class logging:
     def __init__(self, path="Log"):
+        # Defer directory creation until first actual write (see _ensure_path).
+        # Keeps Log/ clean when no variables are being watched.
         self.PATH = os.path.join(path, self.get_time_str())
-        # p = Path(self.PATH).resolve()
-        # p.mkdir(parents=True, exist_ok=True)
-        Path(self.PATH).mkdir(parents=True, exist_ok=True)
+        self._created = False
+
+    def _ensure_path(self):
+        if not self._created:
+            Path(self.PATH).mkdir(parents=True, exist_ok=True)
+            self._created = True
 
     def get_time_str(self, sec=False):
         now = datetime.now()
@@ -53,22 +58,23 @@ class logging:
         else:
             dt_string = now.strftime("%d%m%Y_%H%M")
         return dt_string
-    
+
     def log_to_csv(self, name:str, df_:pd.DataFrame, append=False, timestamp=True):
+        self._ensure_path()
         if append == "horizontal":
             df_.to_csv(os.path.join(self.PATH, f"{name}.csv"), mode='a', header=False)
         elif append == "vertical":
             try:
                 df_prev = pd.read_csv(os.path.join(self.PATH, f"{name}.csv"))
                 write_df = pd.concat([df_prev, df_.reset_index(drop=True)], axis=1)
-                write_df.to_csv(os.path.join(self.PATH, f"{name}.csv")) 
+                write_df.to_csv(os.path.join(self.PATH, f"{name}.csv"))
             except FileNotFoundError:
                 df_.reset_index().to_csv(os.path.join(self.PATH, f"{name}.csv"))
         else:
             df_.to_csv(os.path.join(self.PATH, f"{name}.csv"))
 
     def log_to_txt(self, message:str, name:str, append=True):
-
+        self._ensure_path()
         # TODO: there is no overwrite just append
         with open(os.path.join(self.PATH, f"{name}.txt"), 'a') as f:
             f.write(f"{self.get_time_str(sec=True)}\t{message}\n")

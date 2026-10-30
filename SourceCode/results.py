@@ -16,7 +16,7 @@ import openpyxl
 
 class results:
     
-    def __init__(self, IO_PATH = os.getcwd() + "\\", scenario="BA", country_results=0, iter_results=0, regions=None):
+    def __init__(self, IO_PATH = os.getcwd() + os.sep, scenario="BA", country_results=0, iter_results=0, regions=None):
         self.IO_PATH = IO_PATH
         self.country_results = country_results
         self.iter_results = iter_results

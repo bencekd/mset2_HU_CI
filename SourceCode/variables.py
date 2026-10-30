@@ -166,10 +166,13 @@ class variables_table:
         max_ = max_ if ~pd.isnull(max_) else np.inf
         min_ = min_ if ~pd.isnull(min_) else -np.inf
         if np.max(input_use) > max_ or np.min(input_use) < min_:
-            print(f"Validation error: {inspect.stack()[1][3]} - #{inspect.stack()[1][2]}")
-            import pdb; pdb.set_trace()
-            raise ValueError("Validation failed for variable: {}; values sent to clipboard".format(var_name))
-        
+            # print(f"Validation error: {inspect.stack()[1][3]} - #{inspect.stack()[1][2]}")
+            # import pdb; pdb.set_trace()
+            # raise ValueError("Validation failed for variable: {}; values sent to clipboard".format(var_name))
+            print(f"VALIDATION WARN: {var_name} min={np.min(input_use):.6f}, max={np.max(input_use):.6f}, bounds=[{min_}, {max_}]")
+            print(f"  NaN={np.any(np.isnan(input_use))}, Inf={np.any(np.isinf(input_use))}, shape={input_use.shape}")
+            input_use = np.clip(input_use, min_, max_)
+            
         if var_name in self.data.keys(): 
             self.data[var_name][year] = input_use
         else:

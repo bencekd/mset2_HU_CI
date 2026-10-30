@@ -90,6 +90,9 @@ from SourceCode.initiate_modules import initiate_modules
 from MINDSET_FTT_Power.SourceCode.model_class import ModelRun as ftt
 
 import warnings
+import shutil
+import glob as glob_module
+from datetime import datetime
 
 
 
@@ -199,6 +202,8 @@ class ModelRun:
     
     def __init__(self):
 
+        istruefalse = lambda x: True if x == 'True' else False
+
         # read in the arguments here
         self.settingsini = False
         if len(sys.argv) > 1:
@@ -209,7 +214,7 @@ class ModelRun:
         if self.settingsini:
             config.read(f'{self.settingsini}')
         else:
-            config.read('s_base.ini')
+            config.read('settings.ini')
 
         self.scenario_name = config.get('settings', 'scenario_name')
         self.model_start = int(config.get('settings', 'model_start'))
@@ -217,16 +222,22 @@ class ModelRun:
         # define years to run the model for
         self.years = np.arange(self.model_start, self.model_end + 1)
         # ! keep TRUE unless want to turn-off within year iter
-        self.SWITCH_WITHIN_YEAR_LOOP = config.getboolean('settings', 'SWITCH_WITHIN_YEAR_LOOP')
-        self.mrio_inverse_recalculate = config.getboolean('settings', 'mrio_inverse_recalculate')
+        self.SWITCH_WITHIN_YEAR_LOOP = istruefalse(config.get('settings', 'SWITCH_WITHIN_YEAR_LOOP'))
+        self.mrio_inverse_recalculate = istruefalse(config.get('settings', 'mrio_inverse_recalculate'))
         # TODO these are possibilities to store tax_incidence or dL_ener in file if they are not changing between scenarios
         # TODO these are NOT currently used
         self.tax_incidence_file = str(config.get('settings', 'tax_incidence_file'))    
         self.dL_ener_file = str(config.get('settings', 'dL_ener_file')) 
         # TODO check whether / how this is still relevant?
         self.bta = int(config.get('settings', 'bta'))
-        self.CALIBRATING = config.getboolean('settings', 'CALIBRATING')
-        self.ftt_run = config.getboolean('settings', 'ftt_run')
+        self.CALIBRATING = istruefalse(config.get('settings', 'CALIBRATING'))
+        self.ftt_run = istruefalse(config.get('settings', 'ftt_run'))
+        self.remittance_channel = istruefalse(config.get('settings', 'remittance_channel'))
+        self.cost_curve_run = istruefalse(config.get('settings', 'cost_curves_run'))
+        # first year the fuel-substitution channels (intermediate + household) are active;
+        # earlier years skip them so a transitory shock (e.g. COVID 2020) cannot ratchet
+        # into the energy IO coefficients. Defaults to model_start+1 = original behavior.
+        self.fuel_substitution_start = int(config.get('settings', 'fuel_substitution_start', fallback=self.model_start + 1))
 
         self.COND_LABOR = int(config.get('settings','COND_LABOR')) / 100
         self.COND_TAX = int(config.get('settings','COND_TAX')) / 100
@@ -239,8 +250,9 @@ class ModelRun:
         self.ftt_model = None
 
         # TODO move it from here
-        self.cost_curve_employment = [24,25,26]
-        self.refining_sectors = [62,63,94]
+        if self.cost_curve_run:
+            self.cost_curve_employment = []
+        self.refining_sectors = [23,24,35]
         
         # SPYDER = 'SPY_PYTHONPATH' in os.environ
                 
@@ -401,8 +413,20 @@ class ModelRun:
         self.DYNAMIC = {
             "dy_inv_induced_L1": np.zeros((len(self.EXOG_VARS.R)*len(self.EXOG_VARS.P))), #type:ignore
             'inv_induced_L1': pd.DataFrame(columns=['TRAD_COMM','PROD_COMM','REG_imp','REG_exp','dy']),
+            'household_consumption': {}, # 3-dimensional (countryXproducerXproduct) household consumption, '000 USD constant price (base start year)
+            'fcf_consumption': {}, # 3-dimensional (countryXproducerXproduct) FCF consumption, '000 USD constant price (base start year)
+            'government_consumption': {}, # 3-dimensional (countryXproducerXproduct) government consumption, '000 USD constant price (base start year)
             'output': {}, # 2-dimensional (countryXsector), output, '000 USD constant price (base start year)
+            'new_IO': pd.DataFrame(),
+            'price_index': {}, # price index, cumulative from [start year == 1.0]
+            'investment_price_index': {},
+            'delta_price_yoy': {}, # price change between years, 0.2 is 20%
+            'normal_output': {}, # normal output constant price (base start year) '000 USD
+            'normal_output_growth_helper': {}, 
+            'profit_rate_mean': {},
             'value_added': {}, # value added components, '000 USD current price
+            'cpi': {},
+            'labour_force': {},
             'calibration_error': {},
             'government_spending_by_revenue_source': pd.DataFrame(),
             'govt_spending_delta': pd.DataFrame(),
@@ -412,9 +436,19 @@ class ModelRun:
             'residual_consumption_hh': pd.DataFrame(columns=['REG_exp','REG_imp','TRAD_COMM','VIPA']),
             'residual_consumption_fcf': pd.DataFrame(columns=['REG_exp','REG_imp','TRAD_COMM','VDFA']),
             'residual_consumption_gov': pd.DataFrame(columns=['REG_exp','REG_imp','TRAD_COMM','VIGA']),
+            'emission_cost_intermediates': {},
+            'emission_cost_hh': {},
+            'emission_cost_fcf': {},
+            'emission_cost_gov': {},
+            'cbam_cost_intermediates': {},
+            'cbam_cost_hh': {},
+            'cbam_cost_fcf': {},
+            'cbam_cost_gov': {},
             'carbon_content': pd.DataFrame(),
             'carbon_content_process': pd.DataFrame(),
             'HH_price': {},
+            'HH_delta_inc_rel': {},
+            'gdp_history': {},
             'carbon_tax_revenues': {},
             'investment_converter': pd.DataFrame(),
             'interest_rate_adjust': pd.DataFrame(),
@@ -423,7 +457,12 @@ class ModelRun:
             'dq_exog_gov_prev': np.zeros((len(self.EXOG_VARS.R)*len(self.EXOG_VARS.P))),
             'dq_supply_constraint_no_empl': np.zeros((len(self.EXOG_VARS.R)*len(self.EXOG_VARS.P))),
             'fuel_price': pd.DataFrame(),
-            'cbam_incidence': {}
+            'energy_flows': {},
+            'cbam_incidence': {},
+            'inc_exog': {},
+            'remittance_dlabor': {},      # remittance shock per target country per year, '000 USD nominal
+            'remittance_last_level': {},   # last computed remittance level per target country, '000 USD
+            'gdp_source_prev': {},        # previous-year GDP per source country (for growth-rate calc)
         }
         
         self.DYNAMIC['PROJECTION_OUTPUT'] = self.EXOG_VARS.PROJECTION_OUTPUT
@@ -454,10 +493,279 @@ class ModelRun:
         # ^w        every iteration is a single year with dynamic variables defined in [2.1] carried over as starting values to the next year
         #endregion
         
+    @staticmethod
+    def _archive_folder(folder_path, label="", keep=None):
+        """Archive existing files in a folder to a timestamped subfolder.
+
+        Moves all files (not subdirectories) from `folder_path` into
+        `folder_path/archive_YYYYMMDD_HHMMSS/`.  Does nothing if the
+        folder is empty or does not exist.
+
+        Args:
+            keep: optional set/list of filenames to leave in place (never archived).
+                  Subdirectories are always left in place regardless.
+        """
+        _keep = {'.gitignore', '.DS_Store', 'README.md','energy_flows.Rmd','demand_flows.Rmd','collect_results_long.py'}
+        if keep:
+            _keep.update(keep)
+
+        folder = Path(folder_path)
+        if not folder.is_dir():
+            return
+        files = [f for f in folder.iterdir() if (f.is_file()) and ((f.name not in _keep) and ('Rmd' not in f.name))]
+        if not files:
+            return
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive = folder / f"archive_{stamp}"
+        archive.mkdir(exist_ok=True)
+        for f in files:
+            shutil.move(str(f), str(archive / f.name))
+        print(f"  Archived {len(files)} {label} file(s) to {archive.name}")
+
+    def _assemble_remittance_parquet(self):
+        """Concatenate per-year remittance_{scenario}_{year}.parquet files into
+        a single GLORIA_results/remittance_{scenario}.parquet. This survives
+        _cleanup_working_parquets (which only deletes files ending in _YYYY)
+        and gives the dashboard a single, persistent file to read.
+        Idempotent: no-op if no per-year files exist.
+        """
+        import re
+        pattern = re.compile(
+            rf"^remittance_{re.escape(self.scenario_name)}_\d{{4}}\.parquet$"
+        )
+        rdir = "GLORIA_results"
+        files = sorted(
+            os.path.join(rdir, f) for f in os.listdir(rdir) if pattern.match(f)
+        )
+        if not files:
+            return
+        df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+        out = os.path.join(rdir, f"remittance_{self.scenario_name}.parquet")
+        df.to_parquet(out, index=False)
+        print(f"  Wrote {out} ({len(df):,} rows from {len(files)} per-year files)")
+
+    def _cleanup_working_parquets(self):
+        """Delete per-year working parquets written by write_var() during the run.
+
+        These files (e.g. results_file_long_TJK_empty_energy_flows_2024.parquet)
+        are disk-cache for year-to-year state and are not needed after the run.
+        The numbered summary files (_0.csv, _1.parquet, …) are kept.
+        """
+        import re
+        removed = 0
+        WORKING_PREFIXES = ("results_file_long_", "emissions_", "remittance_")
+        for fname in os.listdir("GLORIA_results"):
+            # Match per-year files: ends with a 4-digit year before the extension
+            if re.search(r'_\d{4}\.(parquet|csv)$', fname) and any(fname.startswith(p) for p in WORKING_PREFIXES):
+                try:
+                    os.remove(os.path.join("GLORIA_results", fname))
+                    removed += 1
+                except OSError:
+                    pass
+        if removed:
+            print(f"  Cleaned up {removed} working parquet/CSV file(s) from GLORIA_results/")
+
+    _RESIDUAL_KEYS = ('residual_consumption_hh',
+                      'residual_consumption_fcf',
+                      'residual_consumption_gov')
+
+    @classmethod
+    def _residuals_are_empty(cls, residuals_obj):
+        """True if a residuals dict holds no actual residual rows.
+
+        Happens when calibration exits on its first iteration via the ERROR
+        revert path: the *_prev frames it reverts to are still the empty
+        placeholders, so an empty pickle would get written for that year.
+        """
+        if not residuals_obj:
+            return True
+        for key in cls._RESIDUAL_KEYS:
+            df = residuals_obj.get(key)
+            if df is not None and len(df) > 0:
+                return False
+        return True
+
+    @classmethod
+    def _load_residuals_file(cls, year):
+        """Load Residuals/residuals_{year}.pkl, or None if missing/unreadable."""
+        path = os.path.join("Residuals", f"residuals_{year}.pkl")
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path, 'rb') as handle:
+                return pickle.load(handle)
+        except (EOFError, pickle.UnpicklingError, OSError):
+            return None
+
+    @classmethod
+    def _load_previous_year_residuals(cls, year):
+        """Residuals of `year - 1`, or None if unusable.
+
+        Only one year back is needed: a year that failed to produce its own
+        residuals has last year's written into its pickle instead, so
+        `year - 1` is always populated if calibration ever succeeded.
+        """
+        residuals = cls._load_residuals_file(year - 1)
+        if cls._residuals_are_empty(residuals):
+            return None
+        return residuals
+
+    def _append_calibration_summary_row(self, year, best_residual_df, best_projected_q,
+                                        best_check_country, best_country_max,
+                                        best_sector_mean, exit_reason, iters,
+                                        best_iter, final_step_size,
+                                        EXOG_VARS, MRIO_df_to_vec_DEF):
+        """Append one row describing this year's calibration outcome to the
+        per-year summary CSV.
+
+        Drill-down fields (worst_country / worst_sector / worst_cell) are
+        computed from the BEST iteration's residual_df + projected_q — the
+        residuals that actually get written to Residuals/residuals_{year}.pkl.
+        Column set mirrors GLORIA_results/check_calibration_convergence.py
+        and adds exit_reason / iters / best_iter / final_step_size.
+        """
+        COUNTRY_THRESHOLD = 0.02
+        SECTOR_THRESHOLD = 0.10
+        R_list = EXOG_VARS.R_list
+        P_list = EXOG_VARS.P_list
+        n_R = len(R_list)
+        n_P = len(P_list)
+
+        # Fall back to NaN row if no iteration ever improved (should be
+        # impossible since iter 0 always beats inf, but guard anyway).
+        if (best_residual_df is None) or (best_projected_q is None) \
+           or (best_check_country is None):
+            row = {c: np.nan for c in self._CALIB_SUMMARY_COLS}
+            row.update({
+                "year": year,
+                "convergence_condition": (
+                    f"country_max_abs_err < {COUNTRY_THRESHOLD} "
+                    f"AND sector_mean_abs_err < {SECTOR_THRESHOLD}"),
+                "exit_reason": exit_reason,
+                "iters": iters,
+                "best_iter": best_iter,
+                "final_step_size": final_step_size,
+                "n_sector_cells": 0,
+            })
+            pd.DataFrame([row])[self._CALIB_SUMMARY_COLS].to_csv(
+                self._CALIB_SUMMARY_PATH, mode="a", header=False, index=False)
+            return
+
+        # Reconstruct best-iteration residual vector (same masking as the loop).
+        best_residual_q = MRIO_df_to_vec_DEF(best_residual_df, 'residual_q')
+        best_residual_q = np.asarray(best_residual_q, dtype=float)
+        proj = np.asarray(best_projected_q, dtype=float)
+
+        # --- cell-level |resid / proj| (mirrors loop's `check`) ----------
+        with np.errstate(divide='ignore', invalid='ignore'):
+            cell_frac = np.where(proj != 0, best_residual_q / proj, 0.0)
+        cell_frac = np.nan_to_num(cell_frac, nan=0.0, posinf=0.0, neginf=0.0)
+        abs_cell = np.abs(cell_frac)
+        sector_mean_abs_err = float(abs_cell.mean()) if abs_cell.size else 0.0
+
+        # --- country-level: max over regions of |sum(res)/sum(proj)| -----
+        abs_check_country = np.abs(np.asarray(best_check_country, dtype=float))
+        if abs_check_country.size:
+            ic = int(np.argmax(abs_check_country))
+            worst_country = str(R_list[ic]) if ic < n_R else ""
+            country_max_abs_err = float(abs_check_country[ic])
+        else:
+            worst_country = ""
+            country_max_abs_err = 0.0
+
+        # --- sector-level aggregate: |sum_regions(res) / sum_regions(proj)| ----
+        # vector order is country-outer, sector-inner (see MRIO_vec_to_df).
+        res_mat  = best_residual_q.reshape(n_R, n_P)
+        proj_mat = proj.reshape(n_R, n_P)
+        sector_sum_res  = res_mat.sum(axis=0)
+        sector_sum_proj = proj_mat.sum(axis=0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            sector_abs_err = np.where(sector_sum_proj != 0,
+                                       np.abs(sector_sum_res / sector_sum_proj), 0.0)
+        sector_abs_err = np.nan_to_num(sector_abs_err, nan=0.0, posinf=0.0, neginf=0.0)
+        if sector_abs_err.size:
+            is_ = int(np.argmax(sector_abs_err))
+            worst_sector = str(P_list[is_]) if is_ < n_P else ""
+            worst_sector_abs_err = float(sector_abs_err[is_])
+        else:
+            worst_sector = ""
+            worst_sector_abs_err = 0.0
+
+        # --- worst single cell --------------------------------------------
+        if abs_cell.size and abs_cell.max() > 0:
+            ix = int(np.argmax(abs_cell))
+            worst_cell_region = str(R_list[ix // n_P]) if (ix // n_P) < n_R else ""
+            worst_cell_sector = str(P_list[ix %  n_P]) if (ix %  n_P) < n_P else ""
+            worst_cell_abs_err = float(abs_cell[ix])
+        else:
+            worst_cell_region = ""
+            worst_cell_sector = ""
+            worst_cell_abs_err = 0.0
+
+        row = {
+            "year": year,
+            "converged": (country_max_abs_err < COUNTRY_THRESHOLD) and
+                         (sector_mean_abs_err < SECTOR_THRESHOLD),
+            "convergence_condition": (
+                f"country_max_abs_err < {COUNTRY_THRESHOLD} "
+                f"AND sector_mean_abs_err < {SECTOR_THRESHOLD}"),
+            "n_sector_cells": int(best_residual_q.size),
+            "country_max_abs_err": country_max_abs_err,
+            "country_threshold_met": country_max_abs_err < COUNTRY_THRESHOLD,
+            "worst_country": worst_country,
+            "worst_country_abs_err": country_max_abs_err,
+            "sector_mean_abs_err": sector_mean_abs_err,
+            "sector_threshold_met": sector_mean_abs_err < SECTOR_THRESHOLD,
+            "worst_sector": worst_sector,
+            "worst_sector_abs_err": worst_sector_abs_err,
+            "worst_cell_region": worst_cell_region,
+            "worst_cell_sector": worst_cell_sector,
+            "worst_cell_abs_err": worst_cell_abs_err,
+            "exit_reason": exit_reason,
+            "iters": int(iters),
+            "best_iter": int(best_iter),
+            "final_step_size": float(final_step_size),
+        }
+        pd.DataFrame([row])[self._CALIB_SUMMARY_COLS].to_csv(
+            self._CALIB_SUMMARY_PATH, mode="a", header=False, index=False)
+
     def run(self):
-        
+
+        # Archive previous outputs before overwriting
+        # Files listed in RESULTS_KEEP are permanent fixtures — never moved to archive
+        RESULTS_KEEP = {'results_dashboard.py', 'calibration_convergence_summary.csv'}
+        if self.CALIBRATING:
+            self._archive_folder("Residuals", label="residual")
+            self._archive_folder(os.path.join("GLORIA_results"), label="result", keep=RESULTS_KEEP)
+        else:
+            self._archive_folder(os.path.join("GLORIA_results"), label="result", keep=RESULTS_KEEP)
+
+        # ??? Fix 3: per-year calibration log. Each calibrating year appends one
+        # ??? row to GLORIA_results/calibration_convergence_summary.csv so we have
+        # ??? a persisted trace of exit_reason / iters / step_size / country-
+        # ??? sector-cell drivers without having to rely on captured stdout.
+        # ??? Columns mirror GLORIA_results/check_calibration_convergence.py plus
+        # ??? the in-loop diagnostics.
+        if self.CALIBRATING:
+            self._CALIB_SUMMARY_PATH = os.path.join("GLORIA_results",
+                                                    "calibration_convergence_summary.csv")
+            self._CALIB_SUMMARY_COLS = [
+                "year", "converged", "convergence_condition", "n_sector_cells",
+                "country_max_abs_err", "country_threshold_met",
+                "worst_country", "worst_country_abs_err",
+                "sector_mean_abs_err", "sector_threshold_met",
+                "worst_sector", "worst_sector_abs_err",
+                "worst_cell_region", "worst_cell_sector", "worst_cell_abs_err",
+                # in-model additions (not in the post-hoc script)
+                "exit_reason", "iters", "best_iter", "final_step_size",
+            ]
+            os.makedirs(os.path.dirname(self._CALIB_SUMMARY_PATH) or ".", exist_ok=True)
+            # overwrite with header — each new calibration run starts fresh
+            pd.DataFrame(columns=self._CALIB_SUMMARY_COLS).to_csv(
+                self._CALIB_SUMMARY_PATH, index=False)
+
         for year in self.years:
-            os.system("title MSET-v0.1.1-alpha - {}".format(year))
+            os.system("title MSET - {} - {}".format(self.scenario_name,year))
             if self.ftt_model is None:
                 self.DYNAMIC, self.EXOG_VARS, self.CALIBRATING, self.MRIO_df_to_vec_DEF, \
                                     self.MRIO_vec_to_df_DEF, self.ftt_model, self.Log = self.solve_year(year, self.DYNAMIC, self.EXOG_VARS, 
@@ -472,7 +780,20 @@ class ModelRun:
         print("")
         total_runtime = time.time() - self.start_time
         print("--- Model run: %s seconds ---" % round(total_runtime, 1))
-        
+
+        # --- Post-run: write FullResults Excel (scenario runs only) ---
+        # if not self.CALIBRATING:
+        # self.V.generate_fullresults_excel()
+
+        # --- Post-run: aggregate per-year remittance parquets into a single
+        # persistent file BEFORE cleanup deletes the per-year working files.
+        # Runs in both calibration and scenario so the dashboard can render
+        # remittance levels regardless of run mode.
+        self._assemble_remittance_parquet()
+
+        # --- Post-run: delete per-year working parquets (kept only during run) ---
+        # self._cleanup_working_parquets()
+
         # for k, v in io_aggregate_time.items():
         #     fractime = v / total_runtime * 100
         #     print("Function {k} took {v:.2f} seconds ({fractime:.2f} percent)")
@@ -521,7 +842,7 @@ class ModelRun:
         else:
             calibration_counter = 1
     
-        if CALIBRATING:   
+        if CALIBRATING:
             print(">>>>>>>>> CALIBRATING")
             CALIBRATION_RUNNING = True
             ERROR = False
@@ -547,7 +868,12 @@ class ModelRun:
 
                 # ! exclude cost curve sectors
                 residual_df = MRIO_vec_to_df_DEF(residual_q, 'residual_q')
-                residual_df.loc[residual_df['PROD_COMM'].isin(self.cost_curve_employment), 'residual_q'] = 0.0
+                if self.cost_curve_run:
+                    residual_df.loc[residual_df['PROD_COMM'].isin(self.cost_curve_employment), 'residual_q'] = 0.0
+                    # ! exclude 34 and 11 TEMPORARY TJK
+                    # residual_df.loc[residual_df['PROD_COMM'].isin([11,34]), 'residual_q'] = 0.0
+                residual_q = MRIO_df_to_vec_DEF(residual_df, 'residual_q')
+                
                 residual_q = MRIO_df_to_vec_DEF(residual_df, 'residual_q')
 
                 # ! exclude small values
@@ -569,42 +895,76 @@ class ModelRun:
                 # max diff in sector 10%, max diff in country 1%
                 if (((np.max(np.abs(check_country)) < 0.02) & (np.mean(np.abs(check)) < 0.10) & (calibration_counter > 0)) | (ERROR == True)):
                     # ???????????????????????????????
-                    # ? CALIBRATED SUCCESS
+                    # ? CALIBRATED SUCCESS (or exit via ERROR revert)
                     # ???????????????????????????????
                     CALIBRATION_RUNNING = False
                     DYNAMIC['residual_consumption_hh'] = CALIBRATION_VARS['residual_fd_hh']
                     DYNAMIC['residual_consumption_fcf'] = CALIBRATION_VARS['residual_fd_fcf']
                     DYNAMIC['residual_consumption_gov'] = CALIBRATION_VARS['residual_fd_gov']
                     print("CALIBRATION                       Calibration done.")
+                    # ??? Per-year calibration summary row. Kept from the
+                    # ??? previous fix set — calibration loop itself is
+                    # ??? restored to original behaviour (fixed 0.5 step,
+                    # ??? revert-on-worsening, exit on threshold or ERROR).
+                    # ??? Reports on the final iteration's state since there
+                    # ??? is no best-iteration tracking anymore.
+                    try:
+                        _exit_reason = "error_revert" if ERROR else "converged"
+                        self._append_calibration_summary_row(
+                            year=year,
+                            best_residual_df=residual_df,
+                            best_projected_q=projected_q,
+                            best_check_country=check_country,
+                            best_country_max=float(np.max(np.abs(check_country))),
+                            best_sector_mean=float(np.mean(np.abs(check))),
+                            exit_reason=_exit_reason,
+                            iters=calibration_counter,
+                            best_iter=calibration_counter,
+                            final_step_size=0.5,
+                            EXOG_VARS=EXOG_VARS,
+                            MRIO_df_to_vec_DEF=MRIO_df_to_vec_DEF,
+                        )
+                    except Exception as _e:
+                        # do not let logging kill the run
+                        print("CALIBRATION                       WARN: failed to append "
+                              "summary row for {}: {}".format(year, _e))
                     break
-        
+
                 if (np.max(np.abs(check_country)) > CALIBRATION_VARS['country_check_prev'])  & (calibration_counter > 0):
                     # ???????????????????????????????
                     # ? NON-convergence
                     # ???????????????????????????????
-                    # with open("Temp//all_vars.pkl", "rb") as f:
-                    #     loaded_vars = dill.load(f)
-                    #     locals().update(loaded_vars)
-
                     CALIBRATION_VARS['residual_fd_hh'] = CALIBRATION_VARS['residual_fd_hh_prev']
                     CALIBRATION_VARS['residual_fd_gov'] = CALIBRATION_VARS['residual_fd_gov_prev']
                     CALIBRATION_VARS['residual_fd_fcf'] = CALIBRATION_VARS['residual_fd_fcf_prev']
-        
-                    # CALIBRATION_RUNNING = False
+
+                    # ! reverting to iteration 0 means the residuals are still the
+                    # ! empty placeholders, so this year would be solved with (and
+                    # ! write) zero residuals. Use last year's residuals instead:
+                    # ! the ERROR exit below does one more pass, so the year is
+                    # ! solved with them and they get written for this year too.
+                    if self._residuals_are_empty({
+                            'residual_consumption_hh': CALIBRATION_VARS['residual_fd_hh'],
+                            'residual_consumption_fcf': CALIBRATION_VARS['residual_fd_fcf'],
+                            'residual_consumption_gov': CALIBRATION_VARS['residual_fd_gov']}):
+                        fallback = self._load_previous_year_residuals(year)
+                        if fallback is not None:
+                            CALIBRATION_VARS['residual_fd_hh'] = fallback['residual_consumption_hh']
+                            CALIBRATION_VARS['residual_fd_gov'] = fallback['residual_consumption_gov']
+                            CALIBRATION_VARS['residual_fd_fcf'] = fallback['residual_consumption_fcf']
+                            print("CALIBRATION                       No residuals from this "
+                                  "year's calibration, falling back to {} residuals.".format(year - 1))
+                        else:
+                            print("CALIBRATION                       No residuals from this "
+                                  "year's calibration and none available for {}.".format(year - 1))
+
                     ERROR = True
-        
-                    # DYNAMIC['residual_consumption_hh'] = CALIBRATION_VARS['residual_fd_hh']
-                    # DYNAMIC['residual_consumption_fcf'] = CALIBRATION_VARS['residual_fd_fcf']
-                    # DYNAMIC['residual_consumption_gov'] = CALIBRATION_VARS['residual_fd_gov']
-        
-                    # print(MRIO_vec_to_df(check,'% diff',len(EXOG_VARS.P_list),EXOG_VARS.R).sort_values(by="% diff"))
-                    # print("CALIBRATION                       Mean abs diff per sector: {}".format(np.mean(np.abs(check))))
-                    # print("CALIBRATION                       Mean abs diff by country: {}".format(np.max(np.abs(check_country))))
+
                     print("CALIBRATION                       Calibration did not converge, errors saved.")
                     continue
-        
+
                 # ? [0.5] multiplier has been added to get rid of oscillation behaviour in calibration
-                # ? this decreases steps so more smooth calibration 
+                # ? this decreases steps so more smooth calibration
                 fd_vec = IO_model.calc_fd_vec(residual_q, IO_model.y0) * 0.5
                 
                 #%%
@@ -714,9 +1074,26 @@ class ModelRun:
         self.V.write_var('delta_price_yoy', year, self.V.read_var('dp_all', year))
         if year == self.model_start:
             dyn_price['price_index'] = dyn_price['dp_all'] + 1
+            DYNAMIC['price_index'][year] = dyn_price.drop(columns=['dp_all'])
             dyn_price = dyn_price.drop(columns=['price_index'])
         # bring in existing price change
         dyn_price = self.V.read_var('price_index', year-1, as_df=True).merge(dyn_price, how='left', on=['REG_imp','PROD_COMM'])
+        # Floor dp_all at -0.99 to prevent negative price indices (prices cannot go below zero)
+        n_floored = (dyn_price['dp_all'] < -0.99).sum()
+        if n_floored > 0:
+            print(f"  Price floor applied to {n_floored} sector(s) in year {year} "
+                  f"(dp_all capped at -99%)")
+        # Ceiling dp_all at +1.0 (price doubling per year) to stop cobweb runaway.
+        # dp_all is the sum of all price-change components (carbon tax, output
+        # growth, profit rate, scarcity rent, CBAM, wage, exog cost) after
+        # Leontief amplification; capping it here catches every upstream path.
+        # +100%/year is still extreme (hyperinflation territory) but prevents
+        # the 10,000x compounding we were seeing in TJK/RUS.
+        n_capped = (dyn_price['dp_all'] > 1.0).sum()
+        if n_capped > 0:
+            print(f"  Price ceiling applied to {n_capped} sector(s) in year {year} "
+                  f"(dp_all capped at +200%)")
+        dyn_price['dp_all'] = dyn_price['dp_all'].clip(lower=-0.99, upper=2.0)
         dyn_price['price_index'] = dyn_price['price_index'] * (1 + dyn_price['dp_all'])
         self.V.write_var('price_index', year, dyn_price.drop(columns=['dp_all']), from_df=True)
     
@@ -724,10 +1101,14 @@ class ModelRun:
         if np.min(dyn_price['price_index']) < 0:
             os.system('color 4')
             print("######################################################################################")
-            print("!!!! ERROR: We have a price index that's below zero! That's not good.")
+            print(f"!!!! ERROR: Negative price index in year {year}.")
+            neg_rows = dyn_price[dyn_price['price_index'] < 0]
+            print(f"  Affected: {len(neg_rows)} sector-region pairs")
+            if 'dp_all' in dyn_price.columns:
+                print(neg_rows[['REG_imp','PROD_COMM','price_index','dp_all']].to_string())
+            else:
+                print(neg_rows[['REG_imp','PROD_COMM','price_index']].to_string())
             print("######################################################################################")
-            import pdb; pdb.set_trace()
-            print("Exiting.")
             os.system('color')
             quit()  
     
@@ -815,7 +1196,148 @@ class ModelRun:
         print("--- 3.1 GDP module: %s seconds ---" % round(time.time() - module_time, 1))
         module_time = time.time()
         #endregion
-    
+
+        #region 3.1.1_Remittance_channel [rgba(155,89,182,0.15)]
+        #region desc [rgba(155,89,182,0.60)]
+        # ^w    [3.1.1] Remittance channel
+        # ^w        Shock is the YoY change in the remittance LEVEL:
+        # ^w           shock[T] = remit_level[T] − remit_level[T-1]   (= prev_level × weighted_growth in Mode B)
+        # ^w        Two modes depending on data availability:
+        # ^w        A) EXOGENOUS years (Section 2 of 'remittances' sheet — 2020..2024):
+        # ^w           remit_level[T] = remittance_pct_gdp / 100 × model_GDP_target
+        # ^w           (the WDI percent-of-GDP rate applied to the model's own GDP —
+        # ^w            no WDI absolute USD values are used).
+        # ^w        B) POST-EXOGENOUS years (growth-rate elasticity, e.g. 2025+):
+        # ^w           For each source-country corridor, compute YoY real-output growth rate,
+        # ^w           apply elasticity, and grow remittance from previous year's level:
+        # ^w           remit_level[T] = prev_level × (1 + weighted_growth)
+        # ^w        Units: '000 USD nominal (same as dlabor_exog / labor compensation).
+        # ^w        The lagged remit_level is injected into inc_exog (less total_base for
+        # ^w        clean initialization); household.py YoY differencing of inc_exog then
+        # ^w        recovers shock[T-1] as the per-year income flow into HH demand.
+        #endregion
+
+        remit_params = EXOG_VARS.REMITTANCE_PARAMS
+        remit_exog = getattr(EXOG_VARS, 'REMITTANCE_EXOG', pd.DataFrame())
+        if not remit_params.empty and self.remittance_channel:  # runs during both calibration and scenario
+            target_countries = remit_params['target_country'].unique()
+
+            # Read source-country REAL output at year-1 for growth-rate calc.
+            # We use real output (q_base, constant-price) from the previous fully-solved
+            # year rather than current-year nominal/current-price gdp_base because:
+            #   (a) gdp_base can lose its "constant-price" property in volatile runs
+            #       (source countries like RUS can exhibit price-cobweb contamination
+            #        that blows up gdp_base YoY growth to +200%+);
+            #   (b) real output is a more stable and economically correct driver of
+            #       migrant labor income, which is what remittances respond to;
+            #   (c) using year-1 output adds a 1-year lag to the remittance response,
+            #       which is empirically appropriate — migrants adjust with a lag.
+            # Note: output[year] isn't written until later in solve_year, so year-1 is
+            # the most recent stable value available at this point.
+            output_src = self.V.read_var("output", year - 1, as_df=True)
+
+            for tgt in target_countries:
+                tgt_params = remit_params[remit_params['target_country'] == tgt]
+                total_base_USDk = tgt_params['remittance_base_USDk'].sum()
+
+                # Store source-country REAL output (from year-1) keyed under current year.
+                # YoY growth computed downstream as: output[year-1] / output[year-2] - 1.
+                for _, rp in tgt_params.iterrows():
+                    src = rp['source_country']
+                    src_real_output = output_src.loc[
+                        output_src['REG_imp'] == src, 'output'].sum()
+                    DYNAMIC['gdp_source_prev'][(src, year)] = src_real_output
+
+                # Check for exogenous remittance data (% of GDP format)
+                exog_row = pd.DataFrame()
+                if not remit_exog.empty and 'remittance_pct_gdp' in remit_exog.columns:
+                    exog_row = remit_exog.loc[
+                        (remit_exog['year'] == year) &
+                        (remit_exog['source_country'] == 'ALL') &
+                        (remit_exog['target_country'] == tgt)
+                    ]
+
+                # ── Compute the remittance shock ──
+                if year == self.model_start:
+                    DYNAMIC['remittance_dlabor'][(tgt, year)] = 0.0
+                    DYNAMIC['remittance_last_level'][(tgt)] = total_base_USDk
+
+                elif not exog_row.empty:
+                    # MODE A: Exogenous — remittance as % of MODEL GDP.
+                    # Use WDI's percent-of-GDP rate applied to the model's own GDP.
+                    # WDI absolute USD values (remittance_actual_USDk) are NOT used;
+                    # they remain in the sheet only as a reference for logging.
+                    # Shock is YoY change in level: shock = remit_level − prev_level.
+                    pct_gdp = exog_row.iloc[0]['remittance_pct_gdp']
+                    gdp_hist = self.V.read_var("gdp_base", year, as_df=True).rename(columns={'gdp_base':'gdp'})
+                    tgt_gdp = gdp_hist.loc[
+                        gdp_hist['REG_imp'] == tgt, 'gdp'].sum()
+                    prev_level = DYNAMIC['remittance_last_level'].get(tgt, total_base_USDk)
+                    remit_level = pct_gdp / 100.0 * tgt_gdp
+                    shock = remit_level - prev_level
+                    DYNAMIC['remittance_dlabor'][(tgt, year)] = shock
+                    DYNAMIC['remittance_last_level'][(tgt)] = remit_level
+                    ref_actual = exog_row.iloc[0].get('remittance_actual_USDk', None)
+                    ref_tag = (f" (WDI actual ref: {ref_actual/1e3:,.0f}M)"
+                               if pd.notna(ref_actual) else "")
+                    print(f"    Remittance exogenous ALL→{tgt} year {year}: "
+                          f"{pct_gdp:.1f}% × model GDP {tgt_gdp/1e3:,.0f}M "
+                          f"= {remit_level/1e3:,.0f}M (prev {prev_level/1e3:,.0f}M), "
+                          f"shock={shock/1e3:+,.0f}M{ref_tag}")
+
+                else:
+                    # MODE B: Growth-rate elasticity — grow from previous level.
+                    # Growth rate is computed from source-country REAL output YoY
+                    # (see note above where gdp_source_prev is populated); this
+                    # insulates the remittance channel from source-country price
+                    # cobweb / nominal contamination.
+                    # Shock is YoY change in level: shock = prev_level × weighted_growth.
+                    prev_level = DYNAMIC['remittance_last_level'].get(tgt, total_base_USDk)
+                    weighted_growth = 0.0
+                    for _, rp in tgt_params.iterrows():
+                        src = rp['source_country']
+                        corridor_share = rp['remittance_base_USDk'] / total_base_USDk
+                        elas = rp['elasticity']
+                        # YoY growth rate of source country REAL output
+                        src_out_now = DYNAMIC['gdp_source_prev'].get((src, year), 0)
+                        src_out_prev = DYNAMIC['gdp_source_prev'].get((src, year - 1), 0)
+                        if src_out_prev > 0:
+                            src_growth = (src_out_now / src_out_prev) - 1.0
+                        else:
+                            src_growth = 0.0
+                        weighted_growth += src_growth * elas * corridor_share
+
+                    # Cap weighted_growth at ±15%/year. Source-country real
+                    # output can be contaminated by price-runaway (e.g. RUS
+                    # 2024–2028 showed 193% YoY from cobweb blowup, not real
+                    # migrant-labor conditions). ±15% is generous relative to
+                    # realistic remittance YoY moves (WDI historical band for
+                    # TJK is roughly −25% to +30%, but those are driven by
+                    # crises — in a baseline run we shouldn't be near those).
+                    raw_growth = weighted_growth
+                    weighted_growth = max(-0.15, min(0.15, weighted_growth))
+                    cap_tag = (f" [CAPPED from {raw_growth:+.4f}]"
+                               if raw_growth != weighted_growth else "")
+
+                    shock = prev_level * weighted_growth
+                    remit_level = prev_level + shock  # = prev_level × (1 + weighted_growth)
+                    DYNAMIC['remittance_dlabor'][(tgt, year)] = shock
+                    DYNAMIC['remittance_last_level'][(tgt)] = remit_level
+                    print(f"    Remittance growth-rate→{tgt} year {year}: "
+                          f"prev={prev_level/1e3:,.0f}M × (1{weighted_growth:+.4f}, "
+                          f"from src-real-output YoY){cap_tag} = "
+                          f"{remit_level/1e3:,.0f}M, shock={shock/1e3:+,.0f}M")
+
+        else:
+            # Remittance channel disabled or no params loaded: zero shocks
+            if not remit_params.empty:
+                for tgt in remit_params['target_country'].unique():
+                    DYNAMIC['remittance_dlabor'][(tgt, year)] = 0.0
+                if not self.remittance_channel:
+                    print("    Remittance channel: OFF (disabled in settings.ini)")
+
+        #endregion
+
         #region 3.2_Final_calculations [rgba(155,89,182,0.15)]
         #region desc [rgba(155,89,182,0.60)]
         # ^w    [3.2] Calculate all variables later printed
@@ -851,6 +1373,15 @@ class ModelRun:
         #     change_table = add_meta(change_table, product_col=product_col)
         #     return(change_table)
         
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # ! TEMPORARY SOLUTION
+        import re 
+
+        temp_vars = {}
+        list_ = [x for x in locals().keys() if re.match(r"^(dq_|dempl_|dgdp_|dp_|v_)", x)]
+        for i in list_:
+            temp_vars[i] = locals()[i]
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     
         # dimension_vars = ['REG_imp','Region_names','PROD_COMM','Sector_names']
     
@@ -1077,9 +1608,12 @@ class ModelRun:
         emissions = EXOG_VARS.mrio_list.merge(emissions, how='left', left_on=['Reg_ID','Sec_ID'], right_on=['target-country-iso3','target-sector'])
         emissions = emissions.drop(columns=['target-country-iso3','target-sector']).fillna(0)
         emissions = emissions.groupby(['Reg_ID','Sec_ID']).agg({'deltaPollutant':'sum', 'qPollutant':'sum',
-                                                                                            'deltaProcess':'sum', 'qProcess':'sum', 
+                                                                                            'deltaProcess':'sum', 'qProcess':'sum',
                                                                                             'deltaPollutant_nostructuralchange':'sum'}).reset_index()
-    
+        # Save emissions per year for FullResults assembly
+        emissions['year'] = year
+        emissions.to_parquet(os.path.join("GLORIA_results", f"emissions_{self.scenario_name}_{year}.parquet"), index=False)
+
         ## GOVT revenues
         # !!! this shouldn't stay here
         if year == self.model_start:
@@ -1135,6 +1669,54 @@ class ModelRun:
         # ^w        if dynamic, then results are appended to the same file year-by-year
         #endregion
 
+        # self.V.generate_var_table()
+    
+        # Build remittance summary for results
+        remit_params = EXOG_VARS.REMITTANCE_PARAMS
+        remittance_summary = pd.DataFrame()
+        if not remit_params.empty and self.remittance_channel:
+            remit_rows = []
+            for tgt in remit_params['target_country'].unique():
+                tgt_params = remit_params[remit_params['target_country'] == tgt]
+                total_base = tgt_params['remittance_base_USDk'].sum()
+                level = DYNAMIC['remittance_last_level'].get(tgt, total_base)
+                # Under the new definition shock[T] = level[T] - level[T-1],
+                # so the YoY change in level IS the current-year shock.
+                remittance_change = DYNAMIC['remittance_dlabor'].get((tgt, year), 0.0)
+                # Aggregate row: total remittance level and change
+                remit_rows.append({
+                    'REG_imp': tgt,
+                    'source': 'ALL',
+                    'remittance_level_USDk': level,
+                    'remittance_change_USDk': remittance_change,
+                    'remittance_pct_gdp': None,
+                    'elasticity': None,
+                })
+                # Per-corridor rows with source-country GDP
+                for _, rp in tgt_params.iterrows():
+                    src = rp['source_country']
+                    src_gdp = DYNAMIC['gdp_source_prev'].get((src, year), None)
+                    corridor_share = rp['remittance_base_USDk'] / total_base if total_base > 0 else 0
+                    remit_rows.append({
+                        'REG_imp': tgt,
+                        'source': src,
+                        'remittance_level_USDk': level * corridor_share,
+                        'remittance_change_USDk': None,
+                        'remittance_pct_gdp': None,
+                        'elasticity': rp['elasticity'],
+                        'source_gdp_USDk': src_gdp,
+                    })
+                # Add pct of GDP if available
+                gdp_hist = self.V.read_var("gdp_base", year, as_df=True).rename(columns={'gdp_base':'gdp'})
+                tgt_gdp = gdp_hist.loc[
+                    gdp_hist['REG_imp'] == tgt, 'gdp'].sum()
+                if tgt_gdp > 0:
+                    remit_rows[0]['remittance_pct_gdp'] = (level / tgt_gdp) * 100.0
+            remittance_summary = pd.DataFrame(remit_rows)
+            # Save remittance per year for FullResults assembly
+            remittance_summary['year'] = year
+            remittance_summary.to_parquet(os.path.join("GLORIA_results", f"remittance_{self.scenario_name}_{year}.parquet"), index=False)
+
         # Results = results(scenario=self.scenario_name,regions=EXOG_VARS.R)
         # results_dict = {
         #     'output': output_change, # done
@@ -1173,7 +1755,7 @@ class ModelRun:
         # ! MOVED TO EARLIER
         #endregion
     
-    
+        #region 4.2_New_baseline_values [rgba(241,196,15,0.15)]
         #region desc [rgba(241,196,15,0.70)]
         # ^w    [4.2] New baseline values
         # ^w        take deltas and form new baseline
@@ -1210,19 +1792,25 @@ class ModelRun:
         dyn_hh_cons['VIPA'] = dyn_hh_cons['VIPA'] + dyn_hh_cons['delta_y_inc'] + dyn_hh_cons['delta_y_price'] + dyn_hh_cons['delta_y_save'] \
               + dyn_hh_cons['delta_y_growth']\
               + dyn_hh_cons['delta_y_trade'] + dyn_hh_cons['delta_y_tech'] + dyn_hh_cons['dy_hh_exog']
+        
         # + dyn_hh_cons['dy_LSC']
         # 'dy_LSC'
         try:
             dyn_hh_cons = dyn_hh_cons.drop(columns=['index'])
         except KeyError:
             pass
-    
+
+        # ! stash this year's windfall-spend total (national) before it's dropped below;
+        # ! used further down to compute a save_rate that EXCLUDES windfall spending, so
+        # ! the windfall-detection benchmark (trailing average of save_rate) isn't itself
+        # ! depressed by past windfall spending -- see save_rate_ex_windfall below
+        windfall_spend_national = dyn_hh_cons.groupby('REG_imp')['delta_y_save'].sum().reset_index()
+
         dyn_hh_cons = dyn_hh_cons.drop(columns=['delta_y_inc','delta_y_price','delta_y_save','delta_y_growth','delta_y_trade','delta_y_tech','dy_hh_exog'])\
             .set_index(['REG_imp','REG_exp','TRAD_COMM'])
         # else:
             # dyn_hh_cons['VIPA'] = dyn_hh_cons['VIPA'] + dyn_hh_cons['delta_y_inc'] + dyn_hh_cons['delta_y_price']
             # dyn_hh_cons = dyn_hh_cons.drop(columns=['delta_y_inc','delta_y_price']).set_index(['REG_imp','REG_exp','TRAD_COMM'])
-        
         # ! NO NEGATIVE VALUES
         dyn_hh_cons['VIPA'] = dyn_hh_cons['VIPA'].apply(lambda x: x if x > 0.0 else 0.0) 
         self.V.write_var('household_consumption', year, dyn_hh_cons.reset_index().rename(columns={'VIPA':'household_consumption'}), from_df=True)
@@ -1266,11 +1854,15 @@ class ModelRun:
         module_time = time.time()
     
         # ^b CALC CPI
-        hh_cons = dyn_hh_cons.copy()
-        hh_cons['shares'] = hh_cons['VIPA'] / hh_cons.groupby(['REG_imp'])['VIPA'].transform('sum')
-        cpi_shares = MRIO_vec_to_df_DEF(dp_trade, 'd_price').rename(columns={'REG_imp':'REG_exp','PROD_COMM':"TRAD_COMM"})
-        cpi_shares = hh_cons.reset_index().merge(cpi_shares, how='left', on=['TRAD_COMM','REG_exp'])
-        cpi_shares['cpi'] = cpi_shares['d_price'] * cpi_shares['shares']
+        # ! use HH_price['delta_p_avg'], not dp_trade: dp_trade only carries the
+        # ! production-side (intermediates-only) carbon-tax pass-through, while
+        # ! delta_p_avg is the actual household-facing price change, which also
+        # ! includes the direct household carbon-tax incidence (delta_tax_hh);
+        # ! using dp_trade here silently dropped that component from CPI.
+        hh_cons = HH_price[['REG_imp','TRAD_COMM','delta_p_avg','VIPA_prod']].copy()
+        hh_cons['shares'] = hh_cons['VIPA_prod'] / hh_cons.groupby(['REG_imp'])['VIPA_prod'].transform('sum')
+        cpi_shares = hh_cons.copy()
+        cpi_shares['cpi'] = cpi_shares['delta_p_avg'] * cpi_shares['shares']
         cpi_shares = cpi_shares.groupby(['REG_imp']).agg({'cpi':'sum'}).reset_index()
         cpi_shares['cpi'] = cpi_shares['cpi'] + 1
         cpi_shares = cpi_shares.merge(self.V.read_var('cpi', year-1, as_df=True).rename(columns={'cpi':'cpi_prev'}), how='left', on='REG_imp')
@@ -1290,68 +1882,33 @@ class ModelRun:
         # ^b NEW q_base (output)
         output_pre = self.V.read_var("output", year-1)
         dyn_qbase = output_pre + dq_total
+
+        # ! v_ctax is uncapped by design, so a near-zero-output sector's price/demand
+        # ! terms (esp. dq_hh_price) can swing violently from noise, not a real trend.
+        # ! Previously any dyn_qbase < 0 was hard-zeroed with no memory, so output
+        # ! snapped to exactly 0 then let next year's dq_total alone re-establish full
+        # ! output -- producing a crash-then-rebound cliff instead of a plausible
+        # ! decline. Cap how much output can fall in a single year instead.
+        MAX_ANNUAL_DECLINE = 0.75
+        floor = output_pre * (1 - MAX_ANNUAL_DECLINE)
+        dyn_qbase = np.maximum(dyn_qbase, floor)
+
         if len(dyn_qbase[dyn_qbase < 0]) > 0:
             # TODO temp
             dyn_qbase[dyn_qbase < 0] = 0.0
-            dead_mask = (dyn_qbase == 0.0)
             empl = self.V.read_var("employment_base", year+1)
-            empl[dead_mask] = 0.0
+            empl[dyn_qbase == 0.0] = 0.0
             self.V.write_var("employment_base", year+1, empl)
-            # Freeze price at last year's level rather than zeroing:
-            # setting price_index=0 makes goods appear free, causing NaN/inf in trade
-            # computations (division by zero in calc_IO_coef) and "free goods" distortions.
-            price_frozen = self.V.read_var('price_index', year-1)
-            curr_price = self.V.read_var('price_index', year)
-            curr_price[dead_mask] = price_frozen[dead_mask]
-            self.V.write_var('price_index', year, curr_price)
-            # Zero dp_all for dead sectors: dp_all was computed before zeroing and can be
-            # very large (ctax pushes v_ctax to its 3.0 cap as output→0). If not zeroed,
-            # delta_price_yoy carries this into the next year's energy elasticity model,
-            # triggering explosive cross-price substitution to substitute sectors.
-            dp = self.V.read_var('dp_all', year)
-            dp[dead_mask] = 0.0
-            self.V.write_var('dp_all', year, dp)
-            # delta_price_yoy was already written before this block (from the original
-            # large dp_all). Correct it now so the next year's energy elasticity model
-            # does not trigger explosive cross-price substitution to substitute sectors.
-            dyoy = self.V.read_var('delta_price_yoy', year)
-            dyoy[dead_mask] = 0.0
-            self.V.write_var('delta_price_yoy', year, dyoy)
-            # Zero final demand for dead sectors so the Leontief system does not
-            # generate demand that would force output < 0 again in subsequent years.
-            # Dead producer (REG_imp=R, PROD_COMM=P) ≡ dead supply (REG_exp=R, TRAD_COMM=P).
-            _out_df = self.V.read_var("output", year-1, as_df=True)
-            _dead_supply = _out_df.loc[dead_mask, ['REG_imp','PROD_COMM']].rename(
-                columns={'REG_imp': 'REG_exp', 'PROD_COMM': 'TRAD_COMM'}).assign(_dead=True)
-            if len(_dead_supply) > 0:
-                for _var, _col in [('household_consumption', 'household_consumption'),
-                                   ('fcf_consumption',        'fcf_consumption')]:
-                    _df = self.V.read_var(_var, year, as_df=True)
-                    _flag = _df[['REG_exp','TRAD_COMM']].merge(
-                        _dead_supply, how='left', on=['REG_exp','TRAD_COMM'])['_dead'].fillna(False)
-                    _df.loc[_flag.values, _col] = 0.0
-                    self.V.write_var(_var, year, _df, from_df=True)
-                # Zero IO flows in new_IO (A-matrix base) for dead sectors.
-                # Buyer side: dead sector demands no intermediate inputs.
-                # Seller side: dead sector supplies nothing to other sectors.
-                _dead_buyers = _dead_supply[['REG_exp','TRAD_COMM']].rename(
-                    columns={'REG_exp': 'REG_imp', 'TRAD_COMM': 'PROD_COMM'}).assign(_dead_buy=True)
-                _new_IO = self.V.read_var_df('new_IO', year).copy()
-                _new_IO = _new_IO.merge(_dead_buyers, how='left', on=['REG_imp','PROD_COMM'])
-                _new_IO = _new_IO.merge(
-                    _dead_supply[['REG_exp','TRAD_COMM']].assign(_dead_sell=True),
-                    how='left', on=['REG_exp','TRAD_COMM'])
-                _new_IO.loc[_new_IO['_dead_buy'].fillna(False), ['z_bp','a_bp','a_tech']] = 0.0
-                _new_IO.loc[_new_IO['_dead_sell'].fillna(False), ['z_bp','a_bp']] = 0.0
-                _new_IO = _new_IO.drop(columns=['_dead_buy','_dead_sell'])
-                # Recompute a_tech after seller-side zeroing may have changed grouped sums
-                _new_IO['a_tech'] = _new_IO.groupby(['REG_imp','TRAD_COMM','PROD_COMM'])['a_bp'].transform('sum')
-                self.V.write_var_df('new_IO', year, _new_IO)
+            price = self.V.read_var('price_index', year)
+            price[dyn_qbase == 0.0] = 0.0
+            self.V.write_var('price_index', year, price)
 
         self.V.write_var('output', year, dyn_qbase)
     
         # ^b CALC PRODUCTIVITY
-        prod = np.nan_to_num(dyn_qbase / self.V.read_var("employment_base", year+1))
+        emp = self.V.read_var("employment_base", year+1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            prod = np.where(emp > 1e-6, self.V.read_var("output", year) / emp, 0.0)
         self.V.write_var('productivity', year, prod)
 
         print("--- 4.2.4 DYNAMICS - Others: %s seconds ---" % round(time.time() - module_time, 1))
@@ -1364,6 +1921,13 @@ class ModelRun:
         # set tax rates
         if year == self.model_start:
             tax_rates = MRIO_df_to_vec_DEF(DYNAMIC['value_added'][year-1], "taxes") / self.V.read_var("output_current", year-1)
+            # NOTE: explicit posinf/neginf=0 is required. np.nan_to_num with
+            # default args replaces +inf with sys.float_info.max (~1.8e308),
+            # which is what any zero-output sector (e.g. zero_sectors.py
+            # targets 12/16/23 in TJK) hits here via taxes/0.  That huge
+            # rate then feeds into tax_current = output * price_index *
+            # tax_rates below, blowing up downstream prices.  Zero is the
+            # correct default for zero-output sectors (no output → no tax).
             tax_rates = np.nan_to_num(tax_rates, nan=0.0, posinf=0.0, neginf=0.0)
             for y in self.years:
                 self.V.write_var('tax_rates', y, tax_rates)
@@ -1413,12 +1977,23 @@ class ModelRun:
         depr_current = self.V.read_var('k', year) * self.V.read_var('depreciation_rate', year)
         depr_current = depr_current * self.V.read_var('investment_price_index', year)
 
+        # if year == 2021:
+            # import pdb; pdb.set_trace()
+
         profit_current = va_current - comp_current - tax_current - depr_current
-        profit_rate_current = profit_current / (self.V.read_var("output", year) * self.V.read_var('price_index', year))
-        profit_rate_current = np.nan_to_num(profit_rate_current, nan=0.0, posinf=0.0, neginf=0.0)
+        denom = self.V.read_var("output", year) * self.V.read_var('price_index', year)
+        profit_rate_current = np.divide(profit_current, denom, out=np.zeros_like(profit_current, dtype=float), where=denom>1e-9)
+        profit_rate_current = np.nan_to_num(profit_rate_current, nan=0.0, posinf=1.0, neginf=-1.0)
+        profit_rate_current = np.clip(profit_rate_current, -1.0, 1.0)
 
         self.V.write_var('profit_rate', year, profit_rate_current)
         self.V.write_var('profit_rate_mean', year, (self.V.read_var('profit_rate_mean', year-1) * 2 + self.V.read_var('profit_rate', year-1)) / 3)
+
+        self.V.write_var('va_current', year, va_current)
+        self.V.write_var('comp_current', year, comp_current)
+        self.V.write_var('tax_current', year, tax_current)
+        self.V.write_var('depr_current', year, depr_current)
+        self.V.write_var('profit_current', year, profit_current)
     
         # lag
         # compile data frame
@@ -1429,7 +2004,7 @@ class ModelRun:
         print("--- 4.2.5 DYNAMICS - Value added: %s seconds ---" % round(time.time() - module_time, 1))
         module_time = time.time()
 
-        #? calc save rate; consumption divided by / (compensation / CPI) 
+        #? calc save rate; consumption divided by / (compensation / CPI)
         comp = MRIO_vec_to_df_DEF(comp_current, "compensation").groupby(['REG_imp']).agg({'compensation':'sum'}).reset_index()
         comp = comp.merge(self.V.read_var('cpi', year, as_df=True), how='left', on='REG_imp')
         hh = self.V.read_var('household_consumption', year, as_df=True).groupby(['REG_imp']).agg({'household_consumption':'sum'}).reset_index().rename(columns={'household_consumption':'VIPA'})
@@ -1437,8 +2012,23 @@ class ModelRun:
         comp['save_rate'] = 1 - (comp['VIPA'] / (comp['compensation']/comp['cpi']))
 
         # ! keep static for now
-        # self.V.write_var("save_rate", year, comp[['REG_imp','save_rate']], from_df=True)
-        self.V.write_var("save_rate", year, self.V.read_var("save_rate", year-1))
+        self.V.write_var("save_rate", year, comp[['REG_imp','save_rate']], from_df=True)
+        # self.V.write_var("save_rate", year, self.V.read_var("save_rate", year-1))
+
+        # ! windfall-spend detection (household.py::calc_hh_demand_change) compares THIS
+        # ! year's endog_save -- which excludes this year's own not-yet-decided windfall
+        # ! spend, by construction -- against a trailing 3-year average of 'save_rate',
+        # ! which DOES include each of those years' windfall spend (household_consumption
+        # ! above is already post-windfall). Windfall spend lowers save_rate, which lowers
+        # ! next years' benchmark, making it easier to pass, triggering more windfall
+        # ! spend -- a self-reinforcing loop. save_rate_ex_windfall backs the windfall
+        # ! contribution back out first so the trailing benchmark is measured on the same
+        # ! (pre-windfall) basis as endog_save, breaking the loop.
+        comp_ex_windfall = comp.merge(windfall_spend_national, how='left', on='REG_imp')
+        comp_ex_windfall['delta_y_save'] = comp_ex_windfall['delta_y_save'].fillna(0)
+        comp_ex_windfall['VIPA_ex_windfall'] = comp_ex_windfall['VIPA'] - comp_ex_windfall['delta_y_save']
+        comp_ex_windfall['save_rate_ex_windfall'] = 1 - (comp_ex_windfall['VIPA_ex_windfall'] / (comp_ex_windfall['compensation']/comp_ex_windfall['cpi']))
+        self.V.write_var("save_rate_ex_windfall", year, comp_ex_windfall[['REG_imp','save_rate_ex_windfall']], from_df=True)
     
         #endregion
     
@@ -1472,6 +2062,18 @@ class ModelRun:
         pop.loc[:,'growth'] = pop['value'] / pop.groupby(['Agg_region'])['value'].shift()
         pop = pop[pop['year'] == year+1]
         # Lfd_Nr_agg | Agg_region | year | value | growth
+    
+        # update consumption
+        # REG_imp | REG_exp | TRAD_COMM | VIPA
+    
+        # ! TEMPORARILY US IT FOR CALIBRATION RESIDUALS
+    
+        # consumption = dyn_hh_cons.reset_index()
+        # consumption = consumption.merge(pop.drop(columns=['Lfd_Nr_agg','value','year']), left_on='REG_imp', right_on='Agg_region')
+        # consumption['VIPA'] = consumption['VIPA'] * (consumption['growth'] - 1)
+        # consumption = consumption[['REG_imp','REG_exp','TRAD_COMM','VIPA']].set_index(['REG_imp','REG_exp','TRAD_COMM'])
+        # DYNAMIC['growth_consumption'] = consumption
+        #endregion
     
         #region 4.5_Capital_stock [rgba(241,196,15,0.15)]
         #region desc [rgba(241,196,15,0.70)]
@@ -1581,6 +2183,9 @@ class ModelRun:
                    .rename(columns={'dk':'dk_exog'}),how='left', on=['PROD_COMM','REG_imp'])\
                 .merge(INV_model.investment_recyc.groupby(['REG_imp','PROD_COMM']).agg({'dk':'sum'}).reset_index()\
                        .rename(columns={'dk':'dk_recyc'}),how='left', on=['PROD_COMM','REG_imp']) # TODO this is nominal
+        
+        self.V.write_var('dk_exog', year, investment[['PROD_COMM','REG_imp','dk_exog']], from_df=True)
+
         investment = investment.fillna(0)
         # investment['dk'] = investment['dk_induced'] + investment['dk_exog'] + investment['dk_recyc'] + investment['dk_base'] # NOT USED
         investment['dk_base_new'] = investment['dk_induced'] + investment['dk_base'] + investment['dk_recyc']
@@ -1606,13 +2211,21 @@ class ModelRun:
         # so capital stock for next year, will be investment this year, on top of capital stock this year
         capital_stock = self.V.read_var('k', year, as_df=True).merge(self.V.read_var('dk_base', year, as_df=True).rename(columns={'dk_base':'dk'})\
                                                              .groupby(['REG_imp','PROD_COMM']).agg({'dk':'sum'}).reset_index())
-        
+
+        # exogenous investment builds capital too, but stays out of dk_base
+        # (dk_base_new above excludes dk_exog), so the shock depreciates away
+        # instead of persisting in the induced-investment pathway
+        # ! dk_exog must be constant price (base year '000 USD), same as dk_base
+        capital_stock = capital_stock.merge(investment[['REG_imp','PROD_COMM','dk_exog']], how='left', on=['REG_imp','PROD_COMM'])
+        capital_stock['dk_exog'] = capital_stock['dk_exog'].fillna(0)
+
         # ! replace with GLORIA based rates
+        # depr_rate = EXOG_VARS.DEPRECIATION_RATE
         capital_stock = capital_stock.merge(self.V.read_var('depreciation_rate', year, as_df=True), how='left', on=['REG_imp','PROD_COMM'])
-    
-        capital_stock['k'] = capital_stock['k'] * (1-capital_stock['depreciation_rate']) + capital_stock['dk']
+
+        capital_stock['k'] = capital_stock['k'] * (1-capital_stock['depreciation_rate']) + capital_stock['dk'] + capital_stock['dk_exog']
         capital_stock['k'] = capital_stock['k'].apply(lambda x: 0 if x < 0 else x)
-        cap_stock_next = capital_stock.drop(columns=['dk','depreciation_rate'])
+        cap_stock_next = capital_stock.drop(columns=['dk','dk_exog','depreciation_rate'])
         self.V.write_var('k', year+1, cap_stock_next, from_df=True)
     
         #####################
@@ -1653,33 +2266,46 @@ class ModelRun:
     
             # ? so at this point; new gov base will include initial state + trade + residual + recycling
             # ? note this all already had effects in the current year
-    
-            new_gov_base_ = new_gov_base.copy()
-            new_gov_base['VIGA'] = new_gov_base['VIGA'] + new_gov_base['VIGA_dyn'] + new_gov_base['VIGA_trade'] + new_gov_base['VIGA_residual'] + new_gov_base['VIGA_recyc']
-            #  + new_gov_base['dy_LSC']
+
+            # new GOV_BASE    
+            # VIGA - is base level at the beginning of the year
+            # VIGA_dyn - is addition calculated in (t-1), and applied this year
+            # VIGA_trade - is reorgansied trade flows
+            # VIGA_residual - is residual demanded added in this year
+            # VIGA_recyc - is coming from ctax reycling
+
+            # ? we want to exclude residual for the endogenous calculation
+
+            gov_consumption_wo_residual = self.V.read_var("gov_consumption_wo_residual", year-1, as_df=True)
+            gov_consumption_wo_residual = gov_consumption_wo_residual.rename(columns={'gov_consumption_wo_residual':'VIGA'})
+            gov_consumption_wo_residual = gov_consumption_wo_residual.merge(DYNAMIC['govt_spending_delta'].reset_index().rename(columns={'VIGA':'VIGA_dyn'}), how='outer')
+            gov_consumption_wo_residual = gov_consumption_wo_residual.merge(fd_trade_response['3d']['GOV_d'].rename(columns={'dVIGA':'VIGA_trade'}), how='outer')
+            gov_consumption_wo_residual['VIGA'] = gov_consumption_wo_residual['VIGA'] + gov_consumption_wo_residual['VIGA_dyn'] + gov_consumption_wo_residual['VIGA_trade']
+
+            self.V.write_var('gov_consumption_wo_residual', year, gov_consumption_wo_residual.drop(columns=['VIGA_dyn','VIGA_trade']).rename(columns={'VIGA':'gov_consumption_wo_residual'}), from_df=True)
+
+            # ? so the reason that we include residuals in what's passed on to the next year is because if
+            # ? a residual is missing (i.e. no correction for the year) otherwise we would get gaps, which 
+            # ? we don't want so hence VIGA_residual is included with some caveats
+
+            # ? new base includes residual
+
+            new_gov_base['VIGA'] = new_gov_base['VIGA'] + new_gov_base['VIGA_dyn'] + new_gov_base['VIGA_trade'] + new_gov_base['VIGA_recyc'] + new_gov_base['VIGA_residual']
+
             try:
                 new_gov_base = new_gov_base.drop(columns=['index'])
             except KeyError:
                 pass
     
             # ! NO NEGATIVE VALUES
+            # ! next year starting value!
             new_gov_base['VIGA'] = new_gov_base['VIGA'].apply(lambda x: x if x > 0.0 else 0.0) 
             self.V.write_var('government_consumption', year, new_gov_base.drop(columns=['VIGA_dyn','VIGA_trade','VIGA_residual','VIGA_recyc']).rename(columns={'VIGA':'government_consumption'}), from_df=True)
-                                                                                                                                            #  ,'dy_LSC'])
+            # ! this excludes residual
         else:
             self.V.write_var('government_consumption', year, EXOG_VARS.GOV_BASE.reset_index().rename(columns={'VIGA':'government_consumption'}), from_df=True)
 
-        # Zero government_consumption for dead sectors (written after the main zeroing block,
-        # so handled here rather than in that block).
-        _out_dead = self.V.read_var("output", year, as_df=True)
-        _dead_gov = _out_dead.loc[_out_dead['output'] == 0.0, ['REG_imp','PROD_COMM']].rename(
-            columns={'REG_imp': 'REG_exp', 'PROD_COMM': 'TRAD_COMM'}).assign(_dead=True)
-        if len(_dead_gov) > 0:
-            _df = self.V.read_var('government_consumption', year, as_df=True)
-            _flag = _df[['REG_exp','TRAD_COMM']].merge(
-                _dead_gov, how='left', on=['REG_exp','TRAD_COMM'])['_dead'].fillna(False)
-            _df.loc[_flag.values, 'government_consumption'] = 0.0
-            self.V.write_var('government_consumption', year, _df, from_df=True)
+            self.V.write_var('gov_consumption_wo_residual', year, EXOG_VARS.GOV_BASE.reset_index().rename(columns={'VIGA':'gov_consumption_wo_residual'}), from_df=True)
     
         if year == self.model_start:
             DYNAMIC['government_spending_by_revenue_source'] = GOV_model.calc_initial_spending()
@@ -1705,7 +2331,9 @@ class ModelRun:
         if year == self.model_start:
             DYNAMIC['govt_spending_delta'] = GOV_model.calc_gov_demand(government_spending, self.V.read_var('price_index', year, as_df=True), self.V.read_var_df('emission_cost_gov', year))
         else:
-            DYNAMIC['govt_spending_delta'] = GOV_model.calc_gov_demand(government_spending, self.V.read_var('price_index', year, as_df=True), self.V.read_var_df('emission_cost_gov', year), new_gov_base=new_gov_base_)
+            gov_consumption_wo_residual = self.V.read_var("gov_consumption_wo_residual", year, as_df=True)
+            gov_consumption_wo_residual = gov_consumption_wo_residual.rename(columns={'gov_consumption_wo_residual':'VIGA'})
+            DYNAMIC['govt_spending_delta'] = GOV_model.calc_gov_demand(government_spending, self.V.read_var('price_index', year, as_df=True), self.V.read_var_df('emission_cost_gov', year), new_gov_base=gov_consumption_wo_residual)
     
         print("--- 4.2.7 DYNAMICS - Govt: %s seconds ---" % round(time.time() - module_time, 1))
     

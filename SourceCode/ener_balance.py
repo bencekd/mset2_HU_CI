@@ -42,7 +42,7 @@ class ener_balance:
     calc_fuel_substitution
         Calculates fuel substitution based on fuel price changes and output changes.
     hh_fuel_substitution
-        Calculates fuel substitution for huoseholds based on fuel price changes and output changes.
+        Calculates fuel substitution for households based on fuel price changes and real income growth.
     calc_monetary_io_change
         Re-calculates energy related IO coefficients.
     calc_emission_intensities
@@ -135,7 +135,7 @@ class ener_balance:
         # share of flow within REG_imp / target-sector
         mrio = mrio.astype({'PROD_COMM': 'str'})
 
-        # bring in FD 
+        # bring in FD
         hh_base = self.HH_BASE.rename(columns={'VIPA':'z_bp'}).assign(PROD_COMM = "FD_1")
         fcf_base = self.FCF_BASE.rename(columns={'VDFA':'z_bp'}).assign(PROD_COMM = "FD_4")
         gov_base = self.GOV_BASE.rename(columns={'VIGA':'z_bp'}).assign(PROD_COMM = "FD_3")
@@ -223,6 +223,11 @@ class ener_balance:
         gdp_deflator = self.common['other_vars'][['REG_imp','gdp_deflator']].copy()
         energy_flows_total = energy_flows_total.merge(gdp_deflator, how='left', on=['REG_imp'])
         energy_flows_total['dp'] = (1 + energy_flows_total['dp'] + energy_flows_total['ctax_price_impact']) / (1 + energy_flows_total['gdp_deflator']) - 1.0
+        # ? so if dp is oversized and share is small enough leave out from the calculation
+        sel_ = energy_flows_total['share'] < 0.01
+        energy_flows_total.loc[sel_, 'share'] = 0.0
+        energy_flows_total['share'] = energy_flows_total['share'] / energy_flows_total.groupby(['REG_imp','PROD_COMM'])['share'].transform('sum')
+
         energy_flows_total['dp'] = energy_flows_total['dp'] * energy_flows_total['share']
         energy_flows_total = energy_flows_total.groupby(['REG_imp','PROD_COMM']).agg({'fuel_use':'sum','dp':'sum'}).reset_index()
 
@@ -267,12 +272,13 @@ class ener_balance:
         # ! no substitution to own
         energy_flows_substitution.loc[energy_flows_substitution['PROD_COMM']==energy_flows_substitution['TRAD_COMM'], 'delta_price_yoy'] = 0.0
         energy_flows_substitution.loc[energy_flows_substitution['PROD_COMM']==energy_flows_substitution['TRAD_COMM'], 'ctax_price_impact'] = 0.0
-        # ! no substitution signal from dead fuel sectors (fuel_use == 0 means z_bp was
+                # ! no substitution signal from dead fuel sectors (fuel_use == 0 means z_bp was
         # already zeroed in IND_BASE, e.g. coal died last year and IND_BASE was cleaned).
         # Without this guard, NaN component_shares propagate through the calculation and
         # can produce non-zero fuel_use_change_relative even when there is no actual flow.
         energy_flows_substitution.loc[energy_flows_substitution['fuel_use'] == 0, 'delta_price_yoy'] = 0.0
         energy_flows_substitution.loc[energy_flows_substitution['fuel_use'] == 0, 'ctax_price_impact'] = 0.0
+
 
         # ! we also want to keep shares intact across coal/petrol/gas types
         params_price = self.params[[x for x in self.params.columns if '_price' in str(x)] + ['REG_imp','PROD_COMM']].copy()
@@ -302,7 +308,7 @@ class ener_balance:
 
         energy_flows_substitution['share_in_total'] = energy_flows_substitution['fuel_use'] / energy_flows_substitution.groupby(['REG_imp','PROD_COMM'])['fuel_use'].transform('sum')
         energy_flows_substitution['delta_price_yoy_avg'] = (energy_flows_substitution['delta_price_yoy_fuel'] + energy_flows_substitution['ctax_price_impact'])* energy_flows_substitution['share_in_total']
-        energy_flows_substitution['delta_price_yoy_avg'] = energy_flows_substitution.groupby(['REG_imp','PROD_COMM'])['delta_price_yoy_avg'].transform('sum')
+        # energy_flows_substitution['delta_price_yoy_avg'] = energy_flows_substitution.groupby(['REG_imp','PROD_COMM'])['delta_price_yoy_avg'].transform('sum')
 
         # ? aggregate across trade partners
         energy_flows_substitution['share_in_fuel'] = energy_flows_substitution['fuel_use'] / energy_flows_substitution.groupby(['REG_imp','PROD_COMM','fuel'])['fuel_use'].transform('sum')
@@ -311,7 +317,7 @@ class ener_balance:
         # energy_flows_substitution['delta_price_yoy_avg_fuel'] = energy_flows_substitution.groupby(['REG_imp','PROD_COMM','fuel'])['delta_price_yoy_avg_fuel'].transform('sum')
 
         # use 'mean' here as aggregate because values should be identical across the group
-        energy_flows_substitution = energy_flows_substitution.groupby(['REG_imp','PROD_COMM','fuel']).agg({'delta_price_yoy_avg':'mean','delta_price_yoy_avg_fuel':'sum','fuel_use':'sum'}).reset_index()
+        energy_flows_substitution = energy_flows_substitution.groupby(['REG_imp','PROD_COMM','fuel']).agg({'delta_price_yoy_avg':'sum','delta_price_yoy_avg_fuel':'sum','fuel_use':'sum'}).reset_index()
         
         # now we have price change and stuff, let's add output and coefficients
         energy_flows_substitution = energy_flows_substitution.merge(output, how='left', on=['REG_imp','PROD_COMM'])
@@ -425,41 +431,60 @@ class ener_balance:
             'io_impact': energy_flows_substitution[['REG_imp','REG_exp','PROD_COMM','TRAD_COMM','fuel_use_change_relative']].copy()
         }
     
-    def hh_fuel_substitution(self, energy_flows, hh_cons, hh_cons_prev, hh_price):
+    def hh_fuel_substitution(self, energy_flows, hh_cons, hh_price, delta_inc_rel):
         # ? hh substitution across energy carriers
         # ! NOTE: we only do substitution here, because own price elasticity
         # ! is in the HH module, so overall value of energy (constant price)
         # ! shouldn't change going out of this module
         # hh_cons is REG_imp | REG_exp | TRAD_COMM | VIPA
         # hh_price is REG_imp | TRAD_COMM | delta_p_avg | VIPA_prod
+        # delta_inc_rel is REG_imp | delta_inc_rel (real household income growth rate)
 
         # calc tech shares in HH consumption
         hh = hh_cons.reset_index()
         hh = hh[hh['TRAD_COMM'].isin(self.ENERGY_LIST)].copy()
-
-        hh_prev = hh_cons_prev.reset_index().rename(columns={'VIPA':'VIPA_prev'})
-        hh_prev = hh_prev[hh_prev['TRAD_COMM'].isin(self.ENERGY_LIST)].copy()
-
-        hh = hh.merge(hh_prev, how="outer").fillna(10)
 
         # fuel price
         fuel_price = self.common['fuel_price'].query("PROD_COMM == 'FD_1'").drop(columns=['PROD_COMM'])
         hh = hh.merge(fuel_price, how='left', on=['REG_imp','REG_exp','TRAD_COMM'])
 
         hh['physical_value'] = np.nan_to_num(hh['VIPA'] / hh['implicit_price'], nan=0.0, posinf=0.0, neginf=0.0) # kUSD/TJ --> we want TJ
-        
+
         hh_ = hh.copy()
 
-        hh = hh.groupby(['REG_imp','TRAD_COMM']).agg({'physical_value':'sum','VIPA':'sum','VIPA_prev':'sum'}).reset_index()
+        hh = hh.groupby(['REG_imp','TRAD_COMM']).agg({'physical_value':'sum','VIPA':'sum'}).reset_index()
         hh['share'] = hh['physical_value'] / hh.groupby(['REG_imp'])['physical_value'].transform('sum')
+        # ? is share is small exclude (to avoid pushing the price)
+        sel_ = hh['share'] < 0.01
+        hh.loc[sel_, 'share'] = 0.0
+        hh['share'] = hh['share'] / hh.groupby(['REG_imp'])['share'].transform('sum')
+                
+        hh = hh.merge(delta_inc_rel, how='left', on=['REG_imp']).fillna({'delta_inc_rel': 0.0})
 
         # in price we don't know the source anymore, that's fine
         price = hh_price[hh_price['TRAD_COMM'].isin(self.ENERGY_LIST)].copy()
         price = price[['REG_imp','TRAD_COMM','delta_p_avg']].copy()
-        price['price_d'] = np.nan_to_num(price['delta_p_avg'] - price.groupby(['REG_imp'])['delta_p_avg'].transform('mean'), nan=1.0)
+
+        # if share is small correct price_d too
+        price = price.merge(hh[['REG_imp','TRAD_COMM','share']], how='left', on=['REG_imp','TRAD_COMM'])
+        sel_ = (price['share'] == 0)
+        price.loc[sel_, 'delta_p_avg'] = 0
+
+        # ! share-weighted basket price index, replacing the old price_d/relative_price
+        # ! pair. The previous relative_price = (1+price_d)/(1+share*price_d)-1 used a
+        # ! single carrier's own share*deviation as the "basket" term, which has a pole
+        # ! at price_d = -1/share, fed by an unweighted mean across all carriers
+        # ! (dominated by whichever carrier has the largest price swing, regardless of
+        # ! its share). A large swing in a small carrier could push another carrier's
+        # ! price_d past the pole and flip the sign of relative_price, producing an
+        # ! inverted (and enormous) substitution response. A share-weighted basket mean
+        # ! can't reach the pole: since shares sum to 1, p_bar is a convex combination
+        # ! of delta_p_avg, so 1+p_bar can only approach zero if the whole basket
+        # ! collapses together, not because of one carrier's own move.
+        price['p_bar'] = (price['share'] * price['delta_p_avg']).groupby(price['REG_imp']).transform('sum')
         # ? HH price already includes carbon tax!
         # TODO is this true?
-        hh = hh.merge(price, how='left', on=['REG_imp','TRAD_COMM'])
+        hh = hh.drop(columns=['share']).merge(price, how='left', on=['REG_imp','TRAD_COMM'])
 
         params_price = self.params_hh[[x for x in self.params_hh.columns if '_price' in str(x)] + ['REG_imp']].copy()
         params_output = self.params_hh[[x for x in self.params_hh.columns if '_income' in str(x)] + ['REG_imp']].copy()
@@ -488,8 +513,12 @@ class ener_balance:
         hh = hh.merge(params_output, how='left', on=['REG_imp','TRAD_COMM'])
         hh['income_beta'] = hh['income_beta'].fillna(0)
 
-        hh['relative_price'] = np.nan_to_num((1 + hh['price_d']) / (1 + hh['share'] * hh['price_d']) - 1, nan=0.0, posinf=0, neginf=0)
-        hh['spent'] = np.nan_to_num(hh['VIPA'] / hh['VIPA_prev'] - 1.0, nan=0.0, posinf=0, neginf=0)
+        hh['relative_price'] = np.nan_to_num((1 + hh['delta_p_avg']) / (1 + hh['p_bar']) - 1, nan=0.0, posinf=0, neginf=0)
+        #? set relative price zero for small sectors (was previously achieved by
+        #? zeroing price_d for these rows; kept as an explicit step now that
+        #? relative_price is computed straight from delta_p_avg/p_bar)
+        hh.loc[hh['share'] == 0, 'relative_price'] = 0.0
+        hh['spent'] = hh['delta_inc_rel']
         
         #### TJ
         hh['physical_value_new'] = hh['physical_value']\
@@ -547,6 +576,7 @@ class ener_balance:
         # POLLUTANT value in tonnes; z_bp in kUSD
         emission_intensity['EF_ktCO2_per_kUSD'] = (emission_intensity['POLLUTANT_VALUE'] / 1000) / emission_intensity['z_bp']
         emission_intensity = emission_intensity.fillna(0)
+        emission_intensity['EF_ktCO2_per_kUSD'] = np.clip(emission_intensity['EF_ktCO2_per_kUSD'], 0, 10)
 
         return(emission_intensity[['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','EF_ktCO2_per_kUSD']].copy())
     
@@ -615,17 +645,57 @@ class ener_balance:
         emission_cost = emission_cost[(emission_cost['emission_ktco2'] > 0)]
         emission_cost = emission_cost.fillna(0)
 
+        # bring in current-year price index (keyed to the traded commodity's origin, as in trade.py)
+        # so the real (constant-price) z_bp can be inflated to nominal terms for comparison against
+        # emission_cost, which is nominal (ktco2 * nominal ctax)
+        price_index_flow = self.common['price_index'].rename(columns={'REG_imp':'REG_exp','PROD_COMM':'TRAD_COMM'})
+        emission_cost = emission_cost.merge(price_index_flow, how='left', on=['REG_exp','TRAD_COMM'])
+        emission_cost['price_index'] = emission_cost['price_index'].fillna(1)
+
         emission_cost = emission_cost.merge(carbon_tax_rate.astype({'PROD_COMM':'str','TRAD_COMM':'int'}), how='left', on=['REG_imp','PROD_COMM','REG_exp','TRAD_COMM'])
         emission_cost = emission_cost[~emission_cost['ctax'].isna()]
-        
-        emission_cost['emission_cost'] = emission_cost['emission_ktco2'] * emission_cost['ctax'] 
+
+        # bring in prior-year price index (for flow-level sec_infl) and prior-year applied cost (for the ratchet below)
+        price_index_prev_flow = self.common['price_index_prev'].rename(
+            columns={'REG_imp':'REG_exp','PROD_COMM':'TRAD_COMM','price_index':'price_index_prev'})
+        emission_cost = emission_cost.merge(price_index_prev_flow, how='left', on=['REG_exp','TRAD_COMM'])
+        emission_cost['price_index_prev'] = emission_cost['price_index_prev'].fillna(1)
+        sec_infl_flow = np.where(emission_cost['price_index_prev'] > 0,
+                                  emission_cost['price_index'] / emission_cost['price_index_prev'], 1.0)
+
+        prev_applied = self.common['prev_emission_cost'].pipe(lambda d: d[d['REG_imp']==country])\
+            .rename(columns={'emission_cost':'prev_applied_cost'})
+        emission_cost = emission_cost.merge(prev_applied, how='left', on=['REG_imp','PROD_COMM','REG_exp','TRAD_COMM'])
+        emission_cost['prev_applied_cost'] = emission_cost['prev_applied_cost'].fillna(0)
+
+        emission_cost['emission_cost_intended'] = emission_cost['emission_ktco2'] * emission_cost['ctax']
+        # ! ratchet: the applied cost can grow at most STEP_FRACTION x the flow's current nominal value per year,
+        # ! on top of last year's applied cost expressed at this year's prices (prev_applied_cost * sec_infl_flow) —
+        # ! rather than being capped fresh to a fixed multiple of z_bp every year, which made emission_cost track
+        # ! price_index exactly once bound, and got fully cancelled out by the sec_infl-adjusted YoY differencing
+        # ! that feeds v_ctax downstream (initiate_modules.py), silencing further ctax increases entirely once capped
+        STEP_FRACTION = 2.0
+        z_bp_nominal = emission_cost['z_bp'] * emission_cost['price_index']
+        prev_applied_nominal = emission_cost['prev_applied_cost'] * sec_infl_flow
+        step_max = STEP_FRACTION * z_bp_nominal
+        emission_cost['emission_cost'] = np.minimum(emission_cost['emission_cost_intended'], prev_applied_nominal + step_max)
+
+        sel_ = emission_cost['emission_cost_intended'] > emission_cost['emission_cost']
+        diag_cols = ['REG_imp','REG_exp','PROD_COMM','TRAD_COMM','intended_ctax','adjusted_ctax']
+        if sel_.any():
+            diag_ = emission_cost.loc[sel_, ['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','ctax','emission_cost','emission_cost_intended','emission_ktco2']].copy()
+            diag_['adjusted_ctax'] = diag_['emission_cost'] / diag_['emission_ktco2']
+            diag_ = diag_.rename(columns={'ctax':'intended_ctax'})[diag_cols]
+        else:
+            diag_ = pd.DataFrame(columns=diag_cols)
+
         # emission in ktCO2, ctax in USD/tCO2; and we want results in kUSD
-        emission_cost = emission_cost[['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','emission_cost','z_bp']].copy()
+        emission_cost = emission_cost[['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','emission_cost','z_bp','price_index']].copy()
 
         emission_cost = emission_cost[~emission_cost['emission_cost'].isna()]
         emission_cost = emission_cost[emission_cost['emission_cost']!=0]
 
-        return emission_cost
+        return emission_cost, diag_
 
     def calculate_tax_incidence(self):
 
@@ -641,7 +711,8 @@ class ener_balance:
                 'tax_incidence_hh': df,
                 'flow_price_impact_hh': df2.rename(columns={'flow_price_impact':'flow_price_impact_hh'}),
                 'tax_incidence_fcf': df,
-                'tax_incidence_gov': df
+                'tax_incidence_gov': df,
+                'ctax_ratchet_diag': pd.DataFrame(columns=['REG_imp','REG_exp','PROD_COMM','TRAD_COMM','intended_ctax','adjusted_ctax'])
             }
 
             return(result)
@@ -663,11 +734,15 @@ class ener_balance:
                 futures_.append(executor.submit(self.tax_incidence_loop, c))
         
             tmp_df = []
+            tmp_diag = []
             # with tqdm(total=len(futures_)) as progress:
             for f in futures.as_completed(futures_):
                     # progress.update()
-                tmp_df.append(f.result())
+                emission_cost_res, diag_res = f.result()
+                tmp_df.append(emission_cost_res)
+                tmp_diag.append(diag_res)
             tax_incidence_all = pd.concat(tmp_df)
+            ctax_ratchet_diag = pd.concat(tmp_diag, ignore_index=True)
 
             # results = list(tqdm(executor.map(self.tax_incidence_loop, carbon_tax_countries), 
                     #   total=len(carbon_tax_countries)))
@@ -683,10 +758,12 @@ class ener_balance:
         tax_incidence_fcf = tax_incidence_all_1[tax_incidence_all_1['PROD_COMM']=='FD_4'].copy()
         tax_incidence_gov = tax_incidence_all_1[tax_incidence_all_1['PROD_COMM']=='FD_3'].copy()
 
-        tax_incidence_all_2 = tax_incidence_all[['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','emission_cost','z_bp']].copy()
-        tax_incidence_all_2 = tax_incidence_all_2.groupby(['REG_imp','PROD_COMM','TRAD_COMM']).agg({'emission_cost':'sum','z_bp':'sum'}).reset_index()
-        tax_incidence_all_2['flow_price_impact'] = tax_incidence_all_2['emission_cost'] / tax_incidence_all_2['z_bp']
-        tax_incidence_all_2 = tax_incidence_all_2.drop(columns=['emission_cost','z_bp'])
+        tax_incidence_all_2 = tax_incidence_all[['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','emission_cost','z_bp','price_index']].copy()
+        # inflate z_bp (real) to nominal terms before aggregating/dividing, since emission_cost is nominal
+        tax_incidence_all_2['z_bp_nominal'] = tax_incidence_all_2['z_bp'] * tax_incidence_all_2['price_index']
+        tax_incidence_all_2 = tax_incidence_all_2.groupby(['REG_imp','PROD_COMM','TRAD_COMM']).agg({'emission_cost':'sum','z_bp_nominal':'sum'}).reset_index()
+        tax_incidence_all_2['flow_price_impact'] = tax_incidence_all_2['emission_cost'] / tax_incidence_all_2['z_bp_nominal']
+        tax_incidence_all_2 = tax_incidence_all_2.drop(columns=['emission_cost','z_bp_nominal'])
         # self.temp.write_to_csv(tax_incidence_all, 'tax_incidence_all')
 
         tax_incidence_intermediates_2 = tax_incidence_all_2[~(tax_incidence_all_2['PROD_COMM'].str.contains("FD"))].copy()
@@ -699,7 +776,8 @@ class ener_balance:
             'tax_incidence_fcf': tax_incidence_fcf,
             'tax_incidence_gov': tax_incidence_gov,
             'flow_price_impact_intermediates': tax_incidence_intermediates_2,
-            'flow_price_impact_hh': tax_incidence_hh_2
+            'flow_price_impact_hh': tax_incidence_hh_2,
+            'ctax_ratchet_diag': ctax_ratchet_diag
         }
 
         return(result)
