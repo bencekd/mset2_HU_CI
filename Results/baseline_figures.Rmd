@@ -1,6 +1,6 @@
 ---
 title: "MINDSET2 Baseline"
-subtitle: "IPCC regions; up to 2050"
+subtitle: "IPCC regions; up to 2050; results: `r params$results_dir`"
 date: "`r format(Sys.time(), '%d %B, %Y %H:%M')`"
 output:
   beamer_presentation:
@@ -14,7 +14,17 @@ header-includes:
   - \usepackage[T1]{fontenc}
   - \AtBeginSection{}
   - \AtBeginSubsection{}
+# Usage: set results_dir below (relative to Results/) and press Knit; baseline_figures_empty.pdf is written into that folder.
+# Console: rmarkdown::render("baseline_figures.Rmd", params = list(results_dir = "archive_baseline_empty_YYYYMMDD_HHMM"),
+#            output_dir = "archive_baseline_empty_YYYYMMDD_HHMM", output_file = "baseline_figures_empty.pdf")
+params:
+  results_dir: "."   # change here! Or "." for Results folder
+knit: (function(input, ...) {
+    p <- rmarkdown::yaml_front_matter(input)$params;
+    rmarkdown::render(input, output_dir = file.path(dirname(input), p$results_dir),
+      output_file = "baseline_figures.pdf", envir = globalenv()) })
 ---
+
 
 
 ```{r Load packages,include=FALSE}
@@ -29,6 +39,35 @@ library(plotly)
 
 sysfonts::font_add_google(name = "Roboto Condensed")
 showtext::showtext_auto()
+
+# Fuel sectors identified by name (sheet P), so the energy figures work for GLORIA-120 and any aggregation.
+# GLORIA-120: Coal 24, 25, 62; Petrol 26, 63; Gas 27, 94; Electricity 93; primary fuels 24-27.
+sector_names <- readxl::read_excel(file.path("..", "Data", "MSET_data", "Variable_list_MINDSET.xlsx"), sheet = "P")
+fuel_lookup <- sector_names %>%
+  transmute(code = Lfd_Nr,
+            fuel = case_when(
+              str_detect(Sector_names, regex("hard coal|lignite|coke oven", ignore_case = TRUE)) ~ "Coal",
+              str_detect(Sector_names, regex("petroleum extraction|refined petroleum", ignore_case = TRUE)) ~ "Petrol",
+              str_detect(Sector_names, regex("gas extraction|gaseous fuels", ignore_case = TRUE)) ~ "Gas",
+              str_detect(Sector_names, regex("electric power", ignore_case = TRUE)) ~ "Electricity"),
+            primary = str_detect(Sector_names, regex("hard coal|lignite|petroleum extraction|gas extraction", ignore_case = TRUE))) %>%
+  filter(!is.na(fuel))
+fuel_of <- setNames(fuel_lookup$fuel, fuel_lookup$code)
+primary_fuel_sectors <- fuel_lookup$code[fuel_lookup$primary]
+
+# Results to plot (folder relative to Results/; set in params at the top)
+baseline_name <- "empty"
+scen_of <- function(f) {   # scenario of a results file: numbered summary file or per-year energy flows
+  b <- basename(f)
+  s <- ifelse(grepl("_energy_flows(_fd)?_\\d{4}\\.parquet$", b),
+              sub("^results_file_long_(.+)_energy_flows(_fd)?_\\d{4}\\.parquet$", "\\1", b),
+              sub("^results_file_long_(.+)_\\d+\\.(csv|parquet)$", "\\1", b))
+  ifelse(s == b, NA_character_, s)
+}
+rfiles <- function(pattern) {   # baseline result files in params$results_dir
+  f <- list.files(params$results_dir, pattern = pattern, full.names = TRUE)
+  f[scen_of(f) %in% baseline_name]
+}
 ```
 
 # 2D variables
@@ -36,8 +75,8 @@ showtext::showtext_auto()
 
 ```{r Load data#1 - 2D vars,include=FALSE}
 # parquey
-# files = list.files(pattern="results_file_long.*3.parquet")
-files = list.files(pattern="results_file_long.*0.csv")
+# files = rfiles("results_file_long.*3.parquet")
+files = rfiles("results_file_long.*0.csv")
 
 files[1]
 
@@ -50,14 +89,14 @@ names(read_csv(files[1]))
 ```{r Load data#2 - 2D vars,include=FALSE}
 # read_and_prefix <- function(filename) {
 #   res <- read_parquet(filename, show_col_types = FALSE) %>%
-#     mutate(scenario=str_extract(filename, "(?<=results\\_file\\_long\\_)[a-z_]{1,}")) %>% 
+#     mutate(scenario=str_extract(basename(filename), "(?<=results\\_file\\_long\\_)[a-z_]{1,}")) %>% 
 #     filter(!is.na(fuel_use)) %>% filter(year > 2025 & REG_imp == 'SAS') %>% filter(fuel_use > 0)
 #   return(res)
 # }
 
 read_and_prefix <- function(filename) {
   res <- read_csv(filename, show_col_types = FALSE) %>%
-    mutate(scenario=str_extract(filename, "(?<=results\\_file\\_long\\_)[a-z_]{1,}"))
+    mutate(scenario=str_extract(basename(filename), "(?<=results\\_file\\_long\\_)[a-z_]{1,}"))
   return(res)
 }
 
@@ -559,14 +598,9 @@ df1 %>% left_join(df2) %>%
 
 g <- combined_data %>%
   filter(var_name %in% c('dp_all') & year > 2018 & scenario == 'empty_') %>%
-  mutate(fuel = case_when(
-    PROD_COMM %in% c(24,25,62) ~ "Coal",
-    PROD_COMM %in% c(26,63) ~ "Petrol",
-    PROD_COMM %in% c(27,94) ~ "Gas",
-    PROD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(PROD_COMM)])) %>%
   filter(!is.na(fuel)) %>%
-  filter(PROD_COMM %in% c(24,25,26,27)) %>%
+  filter(PROD_COMM %in% primary_fuel_sectors) %>%
   mutate(PROD_COMM = paste0(fuel, " - ", PROD_COMM)) %>%
   pivot_wider(id_cols=c('REG_imp','PROD_COMM','year'), names_from='var_name', values_from='value') %>%
   group_by(REG_imp, PROD_COMM) %>%
@@ -593,14 +627,9 @@ g
 
 df <- combined_data %>%
   filter(var_name %in% c('dp_all') & year > 2018 & scenario == 'empty_') %>%
-  mutate(fuel = case_when(
-    PROD_COMM %in% c(24,25,62) ~ "Coal",
-    PROD_COMM %in% c(26,63) ~ "Petrol",
-    PROD_COMM %in% c(27,94) ~ "Gas",
-    PROD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(PROD_COMM)])) %>%
   filter(!is.na(fuel)) %>%
-  filter(PROD_COMM %in% c(24,25,26,27)) %>%
+  filter(PROD_COMM %in% primary_fuel_sectors) %>%
   mutate(PROD_COMM = paste0(fuel, " - ", PROD_COMM)) %>%
   pivot_wider(id_cols=c('REG_imp','PROD_COMM','year'), names_from='var_name', values_from='value') %>%
   group_by(REG_imp, PROD_COMM) %>%
@@ -632,7 +661,7 @@ df2 %>%
 
 ```{r Load data#1 - 4D vars,include=FALSE}
 # parquet — load all scenarios
-files = list.files(pattern="results_file_long.*energy_flows_[0-9]{4}.parquet")
+files = rfiles("results_file_long.*energy_flows_[0-9]{4}.parquet")
 head(open_dataset(files[1]),5)
 files
 ```
@@ -641,8 +670,8 @@ files
 ```{r Load data#2 - 4D vars,include=FALSE}
 read_and_prefix <- function(filename) {
   res <- read_parquet(filename, show_col_types = FALSE) %>%
-    mutate(scenario=str_extract(filename, "(?<=_long_).+(?=_energy_flows_\\d{4})")) %>%
-    mutate(year = as.numeric(str_extract(filename, "[0-9]{4}"))) %>%
+    mutate(scenario=str_extract(basename(filename), "(?<=_long_).+(?=_energy_flows_\\d{4})")) %>%
+    mutate(year = as.numeric(str_extract(basename(filename), "[0-9]{4}"))) %>%
     filter(!is.na(fuel_use)) %>% filter(year > 2018) %>% filter(fuel_use > 0)
   return(res)
 }
@@ -667,13 +696,7 @@ unique(combined_data$year)
 
 ```{r Print 2.1a figure,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-    TRUE ~ "Other"
-  )) %>%
+  mutate(fuel = coalesce(unname(fuel_of[as.character(TRAD_COMM)]), "Other")) %>%
   filter(var_name == 'fuel_use') %>%
   filter(scenario %in% c("empty")) %>%
   group_by(scenario, year,REG_imp,fuel) %>% 
@@ -699,13 +722,7 @@ g
 ```{r Print 2.1b figure,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
   filter(REG_imp != 'EAS') %>%
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-    TRUE ~ "Other"
-  )) %>%
+  mutate(fuel = coalesce(unname(fuel_of[as.character(TRAD_COMM)]), "Other")) %>%
   filter(var_name == 'fuel_use') %>%
   filter(scenario %in% c("empty")) %>%
   group_by(scenario, year,REG_imp,fuel) %>% 
@@ -730,12 +747,7 @@ g
 
 ```{r Print 2.1a1 table,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(TRAD_COMM)])) %>%
   filter(var_name == 'fuel_use' & fuel == 'Coal') %>%
   filter(year > 2018 & scenario == 'empty') %>%
   group_by(REG_imp, year,fuel) %>% 
@@ -771,12 +783,7 @@ df1 %>% left_join(df2) %>%
 
 ```{r Print 2.1a2 table,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(TRAD_COMM)])) %>%
   filter(var_name == 'fuel_use' & fuel == 'Petrol') %>%
   filter(year > 2018 & scenario == 'empty') %>%
   group_by(REG_imp, year,fuel) %>% 
@@ -813,12 +820,7 @@ df1 %>% left_join(df2) %>%
 
 ```{r Print 2.1a3 table,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(TRAD_COMM)])) %>%
   filter(var_name == 'fuel_use' & fuel == 'Gas') %>%
   filter(year > 2018 & scenario == 'empty') %>%
   group_by(REG_imp, year,fuel) %>% 
@@ -855,12 +857,7 @@ df1 %>% left_join(df2) %>%
 
 ```{r Print 2.1a4 table,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(TRAD_COMM)])) %>%
   filter(var_name == 'fuel_use' & fuel == 'Electricity') %>%
   filter(year > 2018 & scenario == 'empty') %>%
   group_by(REG_imp, year,fuel) %>% 
@@ -898,13 +895,7 @@ df1 %>% left_join(df2) %>%
 
 ```{r Print 2.2a figure,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-    TRUE ~ "Other"
-  )) %>%
+  mutate(fuel = coalesce(unname(fuel_of[as.character(TRAD_COMM)]), "Other")) %>%
   filter(var_name == 'fuel_use') %>%
   filter(scenario %in% c("empty")) %>%
   group_by(scenario, year,REG_exp,fuel) %>% 
@@ -930,13 +921,7 @@ g
 ```{r Print 2.2b figure,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
   filter(REG_exp != 'EAS') %>%
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-    TRUE ~ "Other"
-  )) %>%
+  mutate(fuel = coalesce(unname(fuel_of[as.character(TRAD_COMM)]), "Other")) %>%
   filter(var_name == 'fuel_use') %>%
   filter(scenario %in% c("empty")) %>%
   group_by(scenario, year,REG_exp,fuel) %>% 
@@ -961,12 +946,7 @@ g
 
 ```{r Print 2.2a1 table,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(TRAD_COMM)])) %>%
   filter(var_name == 'fuel_use' & fuel == 'Coal') %>%
   filter(year > 2018 & scenario == 'empty') %>%
   group_by(REG_exp, year,fuel) %>% 
@@ -1002,12 +982,7 @@ df1 %>% left_join(df2) %>%
 
 ```{r Print 2.2a2 table,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(TRAD_COMM)])) %>%
   filter(var_name == 'fuel_use' & fuel == 'Petrol') %>%
   filter(year > 2018 & scenario == 'empty') %>%
   group_by(REG_exp, year,fuel) %>% 
@@ -1044,12 +1019,7 @@ df1 %>% left_join(df2) %>%
 
 ```{r Print 2.2a3 table,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(TRAD_COMM)])) %>%
   filter(var_name == 'fuel_use' & fuel == 'Gas') %>%
   filter(year > 2018 & scenario == 'empty') %>%
   group_by(REG_exp, year,fuel) %>% 
@@ -1086,12 +1056,7 @@ df1 %>% left_join(df2) %>%
 
 ```{r Print 2.2a4 table,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(TRAD_COMM)])) %>%
   filter(var_name == 'fuel_use' & fuel == 'Electricity') %>%
   filter(year > 2018 & scenario == 'empty') %>%
   group_by(REG_exp, year,fuel) %>% 
@@ -1124,12 +1089,12 @@ df1 %>% left_join(df2) %>%
 ## 2.3 Energy intensity of output
 
 ```{r Load additional data - 4D vars,include=FALSE}
-files = list.files(pattern="results_file_long.*0.csv")
+files = rfiles("results_file_long.*0.csv")
 files
 
 read_and_prefix <- function(filename) {
   res <- read_csv(filename, show_col_types = FALSE) %>%
-    mutate(scenario=str_extract(filename, "(?<=_long_).+(?=_0)"))
+    mutate(scenario=str_extract(basename(filename), "(?<=_long_).+(?=_0)"))
   return(res)
 }
 
@@ -1176,12 +1141,7 @@ g
 
 ```{r Print 2.3b figure,echo=FALSE,warning=FALSE,message=FALSE}
 df <- combined_data %>% 
-  mutate(fuel = case_when(
-    TRAD_COMM %in% c(24,25,62) ~ "Coal",
-    TRAD_COMM %in% c(26,63) ~ "Petrol",
-    TRAD_COMM %in% c(27,94) ~ "Gas",
-    TRAD_COMM == 93 ~ "Electricity",
-  )) %>%
+  mutate(fuel = unname(fuel_of[as.character(TRAD_COMM)])) %>%
   filter(fuel %in% c("Coal","Petrol","Gas")) %>%
   filter(var_name == 'fuel_use') %>%
   filter(scenario %in% c("empty")) %>%
@@ -1209,13 +1169,13 @@ g
 # 1D variables
 
 ```{r, include=FALSE}
-files = list.files(pattern="results_file_long.*2.csv")
+files = rfiles("results_file_long.*2.csv")
 
 names(read_csv(files[1]))
 
 read_and_prefix <- function(filename) {
   res <- read_csv(filename, show_col_types = FALSE) %>%
-    mutate(scenario=str_extract(filename, "(?<=results\\_file\\_long\\_)[a-z_]{1,}"))
+    mutate(scenario=str_extract(basename(filename), "(?<=results\\_file\\_long\\_)[a-z_]{1,}"))
   return(res)
 }
 
@@ -1298,10 +1258,10 @@ df %>%
 
 ```{r Testing, include=FALSE}
 # parquet
-files = list.files(pattern="results_file_long.*4.parquet")
+files = rfiles("results_file_long.*4.parquet")
 head(open_dataset(files[1]),5)
 
-files = list.files(pattern="results_file_long.*2.csv")
+files = rfiles("results_file_long.*2.csv")
 names(read_csv(files[1]))
 ```
 

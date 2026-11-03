@@ -15,7 +15,7 @@ ModelRun class: MINDSET model main program code
 ################################################
 
 If running from CMD you can set input arguments through specifying them in the call, i.e.:
-python RunMINDSET.py "IDN_FFSR_onlyHH" "Yes" "GLORIA_results\\baseline_residuals.xlsx"
+python RunMINDSET.py "IDN_FFSR_onlyHH" "Yes" "Residuals\\baseline_residuals.xlsx"
 
 the arguments in the CMD case are the following
 1) [required] scenario_name, this gets read in from GLORIA_template//Scenarios//XXXX.xlsx
@@ -23,7 +23,7 @@ the arguments in the CMD case are the following
 3) [optional] residual file, provide a residual file (empty scenario result) that should be subtracted from calculated results;
             note that the residuals are subtracted at the end of every year
 
-note: output file will be GLORIA_results\\FullResults_XXXX.xlsx
+note: results are written to Results/ (see CLAUDE.md)
 
 This code puts together all individual modules and elements of the model, all individual scripts are imported here.
 The 'ModelRun' class shows step-by-step the order of modules as they are being solved.
@@ -85,9 +85,9 @@ from SourceCode.ftt_power import solve_year_ftt
 from SourceCode.cost_curves import cost_curves
 from SourceCode.utils import temporary_storage
 from SourceCode.utils import logging
+from SourceCode.utils import console_color, console_title
 from SourceCode.utils import MRIO_df_to_vec, MRIO_vec_to_df, MRIO_mat_to_df
 from SourceCode.initiate_modules import initiate_modules
-from MINDSET_FTT_Power.SourceCode.model_class import ModelRun as ftt
 
 import warnings
 import shutil
@@ -249,10 +249,6 @@ class ModelRun:
         
         self.ftt_model = None
 
-        # TODO move it from here
-        if self.cost_curve_run:
-            self.cost_curve_employment = []
-        self.refining_sectors = [23,24,35]
         
         # SPYDER = 'SPY_PYTHONPATH' in os.environ
                 
@@ -290,32 +286,32 @@ class ModelRun:
         # ^w        3) [optional] residual file, provide a residual file (empty scenario result) that should be subtracted from calculated results;
         # ^w            note that the residuals are subtracted at the end of every year
         # ^w
-        # ^w        note: output file will be GLORIA_results\\FullResults_XXXX.xlsx
+        # ^w        note: results are written to Results/ (see CLAUDE.md)
         #endregion
         
         
         # CATCH if no SCENARIO provided or if SCENARIO file does not exists
         
         if self.scenario_name is None:
-            os.system('color 4')
+            console_color('4')
             print("######################################################################################")
             print("!!!! ERROR: No scenario provided. In CMD mode you need to provide a scenario to run!")
             print("######################################################################################")
             print("Exiting.")
-            os.system('color')
+            console_color()
             quit()
         
         cwd_ = os.getcwd()
         self.scenario_path = os.path.join(cwd_, "Data", "MSET_data", "Scenarios", f"{self.scenario_name}.xlsx")
         if not (os.path.isfile(self.scenario_path)):
-            os.system('color 4')
+            console_color('4')
             print("")
             print("######################################################################################")
             print("!!!! ERROR: Scenario file not found!")
             print("!!!! NOT FOUND: {}".format(self.scenario_path))
             print("######################################################################################")
             print("Exiting.")
-            os.system('color')
+            console_color()
             quit()
         
         print("######################################################################################")
@@ -342,6 +338,9 @@ class ModelRun:
         # INITIALIZE exogenous variables (excluding scenario variables)
         self.EXOG_VARS = exog_vars()
         self.EXOG_VARS.set_multiyear()
+
+        self.cost_curve_employment = self.EXOG_VARS.SECTOR_ROLES['cost_curve']
+        self.refining_sectors = self.EXOG_VARS.SECTOR_ROLES['refining']
         
         self.MRIO_df_to_vec_DEF = lambda df,name: MRIO_df_to_vec(df, 'REG_imp','PROD_COMM',name, self.EXOG_VARS.R_list, self.EXOG_VARS.P_list)
         self.MRIO_df_to_vec_DEF_1 = lambda df,name: MRIO_df_to_vec(df, 'REG_imp','PROD_COMM',name, self.EXOG_VARS.R_list, self.EXOG_VARS.P_list, default_value=1)
@@ -359,7 +358,8 @@ class ModelRun:
         # Setup FTT:Power
 
         if self.ftt_run:
-            
+            from MINDSET_FTT_Power.SourceCode.model_class import ModelRun as ftt
+
             # Instantiate the run
             self.ftt_model = ftt()
             
@@ -367,9 +367,9 @@ class ModelRun:
             self.ftt_model.ftt_start = min(self.ftt_model.timeline)
             mindset_start = min(self.years)
             setup_years = np.arange(self.ftt_model.ftt_start, mindset_start)
-            self.ftt_model.ftt_fuel_converter = pd.read_csv('MINDSET_FTT_Power/Utilities/ftt_to_mindset_fuels.csv')
-            self.ftt_model.ftt_tech_converter = pd.read_csv('MINDSET_FTT_Power/Utilities/ftt_to_mindset_technology.csv')
-            self.ftt_model.ftt_inv_converter = pd.read_csv('MINDSET_FTT_Power/Utilities/ftt_technology_investment_converter.csv')
+            self.ftt_model.ftt_fuel_converter = pd.read_csv(os.path.join('MINDSET_FTT_Power', 'Utilities', 'ftt_to_mindset_fuels.csv'))
+            self.ftt_model.ftt_tech_converter = pd.read_csv(os.path.join('MINDSET_FTT_Power', 'Utilities', 'ftt_to_mindset_technology.csv'))
+            self.ftt_model.ftt_inv_converter = pd.read_csv(os.path.join('MINDSET_FTT_Power', 'Utilities', 'ftt_technology_investment_converter.csv'))
             self.ftt_model.ftt_inv_converter = self.ftt_model.ftt_inv_converter.set_index('PROD_COMM')
             self.ftt_model.investment = dict()
             
@@ -522,9 +522,83 @@ class ModelRun:
             shutil.move(str(f), str(archive / f.name))
         print(f"  Archived {len(files)} {label} file(s) to {archive.name}")
 
+    RESULTS_DIR = "Results"
+    BASELINE_SCENARIO = "empty"   # forward run of this scenario is archived as 'baseline'
+
+    @staticmethod
+    def _is_result_of_scenario(fname, scenario, var_names):
+        """True if a file in Results/ was written by a run of `scenario`.
+
+        Uses the exact names the model writes, so overlapping scenario names
+        (cprice_disagg vs cprice_disagg_rr) and variable names that look like
+        scenario suffixes (hh_ctax_rate vs scenario cprice_disagg_hh) are told apart.
+        """
+        s = re.escape(scenario)
+        v = "|".join(sorted((re.escape(x) for x in var_names), key=len, reverse=True))
+        patterns = [
+            rf"^results_file_long_{s}_\d+\.(csv|parquet)$",        # numbered summary files
+            rf"^results_file_long_{s}_({v})_\d{{4}}\.parquet$",     # per-year variables (write_var_df)
+            rf"^emissions_{s}_\d{{4}}\.parquet$",
+            rf"^remittance_{s}(_\d{{4}})?\.parquet$",
+            rf"^calibration_convergence_summary_{s}\.csv$",
+            rf"^(baseline|scenario)_figures_{s}\.pdf$",
+        ]
+        return any(re.match(p, fname) for p in patterns)
+
+    def _archive_scenario_results(self):
+        """Move this scenario's previous files in Results/ to
+        Results/archive_{calibration|baseline|scenario}_{scenario}_{YYYYMMDD_HHMM}/.
+
+        Other scenarios' files stay, so a scenario run can still be compared with
+        the baseline in Results/. The timestamp is when the archived results were
+        produced (newest file). Label: 'calibration' if they include a calibration
+        summary (calibrating run), 'baseline' for a forward run of BASELINE_SCENARIO,
+        otherwise 'scenario'.
+        """
+        folder = Path(self.RESULTS_DIR)
+        if not folder.is_dir():
+            return
+        var_names = self.V.var_data["VAR_NAME"].dropna().astype(str).tolist()
+        files = [f for f in folder.iterdir()
+                 if f.is_file() and self._is_result_of_scenario(f.name, self.scenario_name, var_names)]
+        if not files:
+            return
+        if any(f.name.startswith("calibration_convergence_summary_") for f in files):
+            kind = "calibration"      # produced by a calibrating run
+        elif self.scenario_name == self.BASELINE_SCENARIO:
+            kind = "baseline"         # forward run of the baseline scenario
+        else:
+            kind = "scenario"
+        stamp = datetime.fromtimestamp(max(f.stat().st_mtime for f in files)).strftime("%Y%m%d_%H%M")
+        archive = folder / f"archive_{kind}_{self.scenario_name}_{stamp}"
+        n = 1
+        while archive.exists():
+            n += 1
+            archive = folder / f"archive_{kind}_{self.scenario_name}_{stamp}_{n}"
+        archive.mkdir()
+        for f in files:
+            shutil.move(str(f), str(archive / f.name))
+        print(f"  Archived {len(files)} result file(s) of '{self.scenario_name}' to {self.RESULTS_DIR}/{archive.name}")
+
+    @staticmethod
+    def _clear_temp_iterations():
+        """Delete Temp/iter{year}-{iter}.csv debug files left by earlier runs."""
+        folder = Path("Temp")
+        if not folder.is_dir():
+            return
+        removed = 0
+        for f in folder.glob("iter*-*.csv"):
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            print(f"  Cleared {removed} debug iteration file(s) from Temp/")
+
     def _assemble_remittance_parquet(self):
         """Concatenate per-year remittance_{scenario}_{year}.parquet files into
-        a single GLORIA_results/remittance_{scenario}.parquet. This survives
+        a single Results/remittance_{scenario}.parquet. This survives
         _cleanup_working_parquets (which only deletes files ending in _YYYY)
         and gives the dashboard a single, persistent file to read.
         Idempotent: no-op if no per-year files exist.
@@ -533,7 +607,7 @@ class ModelRun:
         pattern = re.compile(
             rf"^remittance_{re.escape(self.scenario_name)}_\d{{4}}\.parquet$"
         )
-        rdir = "GLORIA_results"
+        rdir = self.RESULTS_DIR
         files = sorted(
             os.path.join(rdir, f) for f in os.listdir(rdir) if pattern.match(f)
         )
@@ -550,20 +624,22 @@ class ModelRun:
         These files (e.g. results_file_long_TJK_empty_energy_flows_2024.parquet)
         are disk-cache for year-to-year state and are not needed after the run.
         The numbered summary files (_0.csv, _1.parquet, …) are kept.
+        NOT CALLED: the figure scripts read per-year parquet files (e.g. energy_flows),
+        and this would delete them for every scenario in Results/.
         """
         import re
         removed = 0
         WORKING_PREFIXES = ("results_file_long_", "emissions_", "remittance_")
-        for fname in os.listdir("GLORIA_results"):
+        for fname in os.listdir(self.RESULTS_DIR):
             # Match per-year files: ends with a 4-digit year before the extension
             if re.search(r'_\d{4}\.(parquet|csv)$', fname) and any(fname.startswith(p) for p in WORKING_PREFIXES):
                 try:
-                    os.remove(os.path.join("GLORIA_results", fname))
+                    os.remove(os.path.join(self.RESULTS_DIR, fname))
                     removed += 1
                 except OSError:
                     pass
         if removed:
-            print(f"  Cleaned up {removed} working parquet/CSV file(s) from GLORIA_results/")
+            print(f"  Cleaned up {removed} working parquet/CSV file(s) from {self.RESULTS_DIR}/")
 
     _RESIDUAL_KEYS = ('residual_consumption_hh',
                       'residual_consumption_fcf',
@@ -621,7 +697,7 @@ class ModelRun:
         Drill-down fields (worst_country / worst_sector / worst_cell) are
         computed from the BEST iteration's residual_df + projected_q — the
         residuals that actually get written to Residuals/residuals_{year}.pkl.
-        Column set mirrors GLORIA_results/check_calibration_convergence.py
+        Column set mirrors check_calibration_convergence.py
         and adds exit_reason / iters / best_iter / final_step_size.
         """
         COUNTRY_THRESHOLD = 0.02
@@ -731,24 +807,23 @@ class ModelRun:
 
     def run(self):
 
-        # Archive previous outputs before overwriting
-        # Files listed in RESULTS_KEEP are permanent fixtures — never moved to archive
-        RESULTS_KEEP = {'results_dashboard.py', 'calibration_convergence_summary.csv'}
+        # Archive previous outputs before overwriting: residuals (calibrating runs) and this
+        # scenario's previous files in Results/ (other scenarios stay); clear old Temp/ debug files
+        os.makedirs(self.RESULTS_DIR, exist_ok=True)
         if self.CALIBRATING:
             self._archive_folder("Residuals", label="residual")
-            self._archive_folder(os.path.join("GLORIA_results"), label="result", keep=RESULTS_KEEP)
-        else:
-            self._archive_folder(os.path.join("GLORIA_results"), label="result", keep=RESULTS_KEEP)
+        self._archive_scenario_results()
+        self._clear_temp_iterations()
 
         # ??? Fix 3: per-year calibration log. Each calibrating year appends one
-        # ??? row to GLORIA_results/calibration_convergence_summary.csv so we have
+        # ??? row to Results/calibration_convergence_summary_{scenario}.csv so we have
         # ??? a persisted trace of exit_reason / iters / step_size / country-
         # ??? sector-cell drivers without having to rely on captured stdout.
-        # ??? Columns mirror GLORIA_results/check_calibration_convergence.py plus
+        # ??? Columns mirror check_calibration_convergence.py plus
         # ??? the in-loop diagnostics.
         if self.CALIBRATING:
-            self._CALIB_SUMMARY_PATH = os.path.join("GLORIA_results",
-                                                    "calibration_convergence_summary.csv")
+            self._CALIB_SUMMARY_PATH = os.path.join(self.RESULTS_DIR,
+                                                    f"calibration_convergence_summary_{self.scenario_name}.csv")
             self._CALIB_SUMMARY_COLS = [
                 "year", "converged", "convergence_condition", "n_sector_cells",
                 "country_max_abs_err", "country_threshold_met",
@@ -765,7 +840,7 @@ class ModelRun:
                 self._CALIB_SUMMARY_PATH, index=False)
 
         for year in self.years:
-            os.system("title MSET - {} - {}".format(self.scenario_name,year))
+            console_title("MSET - {} - {}".format(self.scenario_name,year))
             if self.ftt_model is None:
                 self.DYNAMIC, self.EXOG_VARS, self.CALIBRATING, self.MRIO_df_to_vec_DEF, \
                                     self.MRIO_vec_to_df_DEF, self.ftt_model, self.Log = self.solve_year(year, self.DYNAMIC, self.EXOG_VARS, 
@@ -1099,7 +1174,7 @@ class ModelRun:
     
         # ! random check on strange prices
         if np.min(dyn_price['price_index']) < 0:
-            os.system('color 4')
+            console_color('4')
             print("######################################################################################")
             print(f"!!!! ERROR: Negative price index in year {year}.")
             neg_rows = dyn_price[dyn_price['price_index'] < 0]
@@ -1109,7 +1184,7 @@ class ModelRun:
             else:
                 print(neg_rows[['REG_imp','PROD_COMM','price_index']].to_string())
             print("######################################################################################")
-            os.system('color')
+            console_color()
             quit()  
     
         price_index = self.V.read_var('price_index', year)
@@ -1612,7 +1687,7 @@ class ModelRun:
                                                                                             'deltaPollutant_nostructuralchange':'sum'}).reset_index()
         # Save emissions per year for FullResults assembly
         emissions['year'] = year
-        emissions.to_parquet(os.path.join("GLORIA_results", f"emissions_{self.scenario_name}_{year}.parquet"), index=False)
+        emissions.to_parquet(os.path.join(self.RESULTS_DIR, f"emissions_{self.scenario_name}_{year}.parquet"), index=False)
 
         ## GOVT revenues
         # !!! this shouldn't stay here
@@ -1715,7 +1790,7 @@ class ModelRun:
             remittance_summary = pd.DataFrame(remit_rows)
             # Save remittance per year for FullResults assembly
             remittance_summary['year'] = year
-            remittance_summary.to_parquet(os.path.join("GLORIA_results", f"remittance_{self.scenario_name}_{year}.parquet"), index=False)
+            remittance_summary.to_parquet(os.path.join(self.RESULTS_DIR, f"remittance_{self.scenario_name}_{year}.parquet"), index=False)
 
         # Results = results(scenario=self.scenario_name,regions=EXOG_VARS.R)
         # results_dict = {

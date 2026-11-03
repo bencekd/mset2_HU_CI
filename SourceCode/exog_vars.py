@@ -13,6 +13,14 @@ import os
 
 import time
 
+GLORIA_SECTOR_ROLES = {
+    'cost_curve': [24, 25, 26],
+    'refining': [62, 63, 94],
+    'non_market': [115, 116, 117, 118],
+    'royalty': list(range(22, 41)),
+    'electricity': [93],
+}
+
 def normalize_path(path):
     """Convert Windows-style paths to platform-independent paths."""
     return path.replace('\\', os.path.sep)
@@ -208,12 +216,52 @@ class exog_vars:
             self.REMITTANCE_EXOG = pd.DataFrame()
             print(f"  No remittance parameters found ({e})")
 
+        self.SECTOR_ROLES = {role: self.gloria_sectors(ids) for role, ids in GLORIA_SECTOR_ROLES.items()}
+        print(f"--- Sector roles ({getattr(self, 'SECTOR_GROUPING_FILE', 'GLORIA 120')}): "
+              + "; ".join(f"{k} {v}" for k, v in self.SECTOR_ROLES.items()) + " ---")
+
         print(f"--- Collected exogenous variables: {round(time.time() - start_time, 1)} s ---")
     
     def pop(self, key):
         self.pop(key, None) #type:ignore
         return True
     
+    def gloria_sectors(self, gloria_ids):
+        gloria_ids = [int(x) for x in gloria_ids]
+        if len(self.P) == 120:
+            return gloria_ids
+        conc = self.sector_concordance()
+        share = conc.groupby('Lfd_Nr_agg')['Lfd_Nr'].apply(lambda s: s.isin(gloria_ids).mean())
+        return [int(a) for a in share.index[share > 0.5]]
+
+    def sector_concordance(self):
+        if getattr(self, 'SECTOR_CONCORDANCE', None) is not None:
+            return self.SECTOR_CONCORDANCE
+        folder = os.path.join(self.IO_PATH, "Data", "MSET_data", "Country_groupings")
+        model_names = dict(zip(self.P['Lfd_Nr'].astype(int), self.P['Sector_names'].astype(str).str.strip()))
+        files = sorted(f for f in os.listdir(folder) if f.endswith('.xlsx') and not f.startswith('~$')) \
+            if os.path.isdir(folder) else []
+        found = {}
+        for f in files:
+            try:
+                pg = pd.read_excel(os.path.join(folder, f), 'product_groups')
+            except ValueError:
+                continue
+            if len(pg) != 120 or not {'Lfd_Nr', 'Lfd_Nr_agg', 'Agg_sector_name'}.issubset(pg.columns):
+                continue
+            names = pg.drop_duplicates('Lfd_Nr_agg')
+            if dict(zip(names['Lfd_Nr_agg'].astype(int), names['Agg_sector_name'].astype(str).str.strip())) == model_names:
+                found[f] = pg[['Lfd_Nr', 'Lfd_Nr_agg']].astype(int).sort_values('Lfd_Nr').reset_index(drop=True)
+        if not found:
+            raise FileNotFoundError(f"No grouping workbook in {folder} has product_groups matching the "
+                                    f"{len(self.P)} model sectors in Variable_list_MINDSET.xlsx (sheet P).")
+        first = next(iter(found.values()))
+        if any(not c.equals(first) for c in found.values()):
+            raise ValueError(f"Grouping workbooks in {folder} disagree on the sector concordance: {list(found)}")
+        self.SECTOR_CONCORDANCE = first
+        self.SECTOR_GROUPING_FILE = next(iter(found))
+        return self.SECTOR_CONCORDANCE
+
     def set_multiyear(self):
         self.MULTIYEAR = True
         return True

@@ -808,10 +808,7 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
         profit_rate_mean_L1.loc[profit_rate_mean_L1['profit_rate_min'] > 0.95, 'profit_rate_min'] = 0.95
         self.V.write_var("profit_rate_min", year, profit_rate_mean_L1[['PROD_COMM','REG_imp','profit_rate_min']], from_df=True)
 
-        # ! we don't want to have profit rate condition on public sectors
-        public_sectors = [52,53,54]
-        # ! TEMPORARY for TJK - no INFLATION target set
-        sel = (profit_rate_mean_L1['profit_rate'] < profit_rate_mean_L1['profit_rate_min']) & (~(profit_rate_mean_L1['PROD_COMM'].isin(public_sectors)))
+        sel = (profit_rate_mean_L1['profit_rate'] < profit_rate_mean_L1['profit_rate_min']) & (~(profit_rate_mean_L1['PROD_COMM'].isin(EXOG_VARS.SECTOR_ROLES['non_market'])))
         profit_rate_mean_L1.loc[sel, 'profit_rate'] = profit_rate_mean_L1['profit_rate_min']
         profit_rate_mean_L1 = profit_rate_mean_L1['profit_rate'].values
 
@@ -820,7 +817,7 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
     dev_profit_rate_L1[abs(dev_profit_rate_L1)==np.inf] = 0.0
     dev_profit_rate_L1[abs(dev_profit_rate_L1)>10] = 0.0
     if len(dev_profit_rate_L1[abs(dev_profit_rate_L1)>10]) > 0:
-        print(f"profit rate issues (>10) sectors: {", ".join(map(str, np.where(dyn_qbase < 0)[0]))}")
+        print(f"profit rate issues (>10) sectors: {', '.join(map(str, np.where(dyn_qbase < 0)[0]))}")
     v_dev_profit_rate = Price_model.dp_profit_rate(dev_profit_rate_L1)
     dp_dev_profit_rate = Price_model.second_order_dprice(v_dev_profit_rate, year=year)['dp_full']
     
@@ -2035,23 +2032,48 @@ def initiate_modules(self, DYNAMIC, EXOG_VARS, MRIO_df_to_vec_DEF, MRIO_vec_to_d
 
             DEBUG = True
             if DEBUG:
-                pd.DataFrame({
-                    'output': dq_total,
-                    'empl': dempl_total,
-                    'current': dp_all,
-                    'old': dp_all_old,
-                    'v_all': v_all,
-                    'v_labor': v_labor,
-                    'v_dev_normal_output': v_dev_normal_output, 
-                    'v_costcurve': v_costcurve,
-                    'dq_empl_constraint': dq_empl_labour_supply_constraint,
-                    'dq_hh_inc': dq_hh_inc,
-                    'dq_hh_price': dq_hh_price,
-                    'dq_hh_save': dq_hh_save,
-                    'dq_total_empl': dq_total_empl,
-                    'dq_trade_eff': dq_trade_eff,
-                    'dq_io_change': dq_io_change,
-                    'empl_constraint': employment_constraint['dL'],
+                # ? one row per region x sector; 'output' is dq_total and the dq_* columns are its components
+                _dbg = lambda x: np.ravel(np.asarray(x, dtype=float))
+                try:
+                    pd.DataFrame({
+                        'output': dq_total,
+                        'empl': dempl_total,
+                        'current': dp_all,
+                        'old': dp_all_old,
+                        'v_all': v_all,
+                        'v_labor': v_labor,
+                        'v_dev_normal_output': v_dev_normal_output, 
+                        'v_costcurve': v_costcurve,
+                        'dq_empl_constraint': dq_empl_labour_supply_constraint,
+                        'dq_hh_inc': dq_hh_inc,
+                        'dq_hh_price': dq_hh_price,
+                        'dq_hh_save': dq_hh_save,
+                        'dq_total_empl': dq_total_empl,
+                        'dq_trade_eff': dq_trade_eff,
+                        'dq_io_change': dq_io_change,
+                        'empl_constraint': employment_constraint['dL'],
+                        'v_output_growth': v_output_growth,
+                        # ? remaining components of dq_total (added for diagnosing divergence)
+                        'dq_tech_eff': _dbg(dq_tech_eff),
+                        'dq_gov_delta': _dbg(dq_gov_delta),
+                        'dq_gov_recyc': _dbg(dq_gov_recyc),
+                        'dq_gov_exog_fd': _dbg(dq_gov_exog_fd),
+                        'dq_inv_induced': _dbg(dq_inv_induced),
+                        'dq_inv_recyc': _dbg(dq_inv_recyc),
+                        'dq_inv_exog': _dbg(dq_inv_exog),
+                        'dq_fcf_exog_fd': _dbg(dq_fcf_exog_fd),
+                        'dq_hh_exog': _dbg(dq_hh_exog),
+                        'dq_hh_exog_fd': _dbg(dq_hh_exog_fd),
+                        'dq_calibration_residual': _dbg(dq_calibration_residual),
+                        'dq_structural_change': _dbg(dq_structural_change),
+                        'dq_supply_constraint': _dbg(dq_supply_constraint),
+                        'dq_supply_constraint_no_empl': _dbg(dq_supply_constraint_no_empl),
+                        'dq_hh_tech_substitution': _dbg(dq_hh_tech_substitution),
+                    }).set_axis(pd.MultiIndex.from_product([EXOG_VARS.R_list, EXOG_VARS.P_list],
+                                                           names=['REG_imp', 'PROD_COMM'])
+                    ).to_csv(os.path.join("Temp", "iter{}-{}.csv".format(year, iter_run)))
+                except Exception as _e:
+                    print(f"DEBUG: Temp/iter{year}-{iter_run}.csv not written ({_e})")
         else:
             price_cond = np.inf
         

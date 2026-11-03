@@ -91,8 +91,8 @@ class IO:
         self.year = 2019
         self.GLORIAv = exog_vars.GLORIAv
 
-        self.CRITICALITY = exog_vars.GLORIA_CRITICALITY.astype({'Nr_Input':'int16','Nr_Ind':'int16'})\
-            .rename(columns={'Nr_Input':'TRAD_COMM','Nr_Ind':'PROD_COMM'})[['PROD_COMM','TRAD_COMM','Criticality']]
+        # self.CRITICALITY = exog_vars.GLORIA_CRITICALITY.astype({'Nr_Input':'int16','Nr_Ind':'int16'})\
+        #     .rename(columns={'Nr_Input':'TRAD_COMM','Nr_Ind':'PROD_COMM'})[['PROD_COMM','TRAD_COMM','Criticality']]
 
         self.HH_BASE = exog_vars.HH_BASE
         self.GOV_BASE = exog_vars.GOV_BASE

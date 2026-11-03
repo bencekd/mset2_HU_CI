@@ -68,6 +68,7 @@ class scenario:
 
         self.REGIONS = EXOG_VARS.R
         self.PRODUCTS = EXOG_VARS.P
+        self.P_IDS = [int(x) for x in EXOG_VARS.P_list]
         self.IND_BASE = EXOG_VARS.IND_BASE.reset_index()
 
         self.HH_BASE = EXOG_VARS.HH_BASE # type: ignore
@@ -157,8 +158,8 @@ class scenario:
         tax_rate = resolve_comma(tax_rate, 'REG_imp')
 
         # treatment of ALL in PROD_COMM, ie all upstream sectors impacted
-        tax_rate = resolve_all(tax_rate, 'PROD_COMM', [x for x in np.arange(1,121)] + ['FD_1','FD_2','FD_3','FD_4','FD_5','FD_6'])
-        tax_rate = resolve_all(tax_rate, 'TRAD_COMM', [x for x in np.arange(1,121)])
+        tax_rate = resolve_all(tax_rate, 'PROD_COMM', list(self.P_IDS) + ['FD_1','FD_2','FD_3','FD_4','FD_5','FD_6'])
+        tax_rate = resolve_all(tax_rate, 'TRAD_COMM', list(self.P_IDS))
         tax_rate = resolve_all(tax_rate, 'REG_exp', self.REGIONS['Region_acronyms'].to_list())
         tax_rate = resolve_all(tax_rate, 'REG_imp', self.REGIONS['Region_acronyms'].to_list())
         
@@ -305,7 +306,7 @@ class scenario:
 
         fd_exog = resolve_comma(fd_exog, "TRAD_COMM")
         fd_exog = resolve_hyphen(fd_exog, "TRAD_COMM")
-        fd_exog = resolve_all(fd_exog, "TRAD_COMM", [str(x) for x in np.arange(1,121)])
+        fd_exog = resolve_all(fd_exog, "TRAD_COMM", [str(x) for x in self.P_IDS])
 
         fd_exog = resolve_comma(fd_exog, "PROD_COMM")
         fd_exog = resolve_all(fd_exog, "PROD_COMM", ['FD_1','FD_3','FD_4'])
@@ -429,7 +430,7 @@ class scenario:
 
         hh_exog = resolve_comma(hh_exog, "TRAD_COMM")
         hh_exog = resolve_hyphen(hh_exog, "TRAD_COMM")
-        hh_exog = resolve_all(hh_exog, "TRAD_COMM", [str(x) for x in np.arange(1,121)])
+        hh_exog = resolve_all(hh_exog, "TRAD_COMM", [str(x) for x in self.P_IDS])
 
         fd_initial = self.HH_BASE.reset_index().rename(columns={'VIPA':'VIPA0'})
         # | REG_exp | REG_imp | TRAD_COMM |
@@ -490,7 +491,7 @@ class scenario:
 
         inv_exog = resolve_comma(inv_exog, "PROD_COMM")
         inv_exog = resolve_hyphen(inv_exog, "PROD_COMM")
-        inv_exog = resolve_all(inv_exog, "PROD_COMM", [x for x in np.arange(1,121)])
+        inv_exog = resolve_all(inv_exog, "PROD_COMM", list(self.P_IDS))
 
         # ? Scenario.fd_exog structure is the following:
         # ? REG_imp | PROD_COMM | Value | Type
@@ -601,7 +602,7 @@ class scenario:
 
         ee_exog = resolve_comma(ee_exog, "PROD_COMM")
         ee_exog = resolve_hyphen(ee_exog, "PROD_COMM")
-        ee_exog = resolve_all(ee_exog, "PROD_COMM", [x for x in np.arange(1,121)])
+        ee_exog = resolve_all(ee_exog, "PROD_COMM", list(self.P_IDS))
 
         ee_exog = ee_exog.groupby(['REG_imp','PROD_COMM']).agg({'Value':'sum'}).reset_index()
         ee_exog = ee_exog.rename(columns={'Value':'ee_change'})
@@ -685,11 +686,11 @@ class scenario:
 
             inv_conv_adj = resolve_comma(inv_conv_adj, "PROD_COMM")
             inv_conv_adj = resolve_hyphen(inv_conv_adj, "PROD_COMM")
-            inv_conv_adj = resolve_all(inv_conv_adj, "PROD_COMM", [x for x in np.arange(1,121)])
+            inv_conv_adj = resolve_all(inv_conv_adj, "PROD_COMM", list(self.P_IDS))
 
             inv_conv_adj = resolve_comma(inv_conv_adj, "TRAD_COMM")
             inv_conv_adj = resolve_hyphen(inv_conv_adj, "TRAD_COMM")
-            inv_conv_adj = resolve_all(inv_conv_adj, "TRAD_COMM", [x for x in np.arange(1,121)])
+            inv_conv_adj = resolve_all(inv_conv_adj, "TRAD_COMM", list(self.P_IDS))
 
             # ? Type can be:
             # ? abs-b | rel-b | abs | rel | replace
@@ -741,7 +742,7 @@ class scenario:
 
         cost_shock = resolve_comma(cost_shock, "PROD_COMM")
         cost_shock = resolve_hyphen(cost_shock, "PROD_COMM")
-        cost_shock = resolve_all(cost_shock, "PROD_COMM", [x for x in np.arange(1,121)])
+        cost_shock = resolve_all(cost_shock, "PROD_COMM", list(self.P_IDS))
 
         # price changes are captured on the level of production sector, not 
 
@@ -770,7 +771,7 @@ class scenario:
 
         supply_constraint = resolve_comma(supply_constraint, 'PROD_COMM')
         supply_constraint = resolve_hyphen(supply_constraint, 'PROD_COMM')
-        supply_constraint = resolve_all(supply_constraint, 'PROD_COMM', [x for x in np.arange(1,121)])
+        supply_constraint = resolve_all(supply_constraint, 'PROD_COMM', list(self.P_IDS))
 
         self.supply_constraint = supply_constraint
 
@@ -794,7 +795,7 @@ class scenario:
 
         supply_constraint_no_empl_change = resolve_comma(supply_constraint_no_empl_change, 'PROD_COMM')
         supply_constraint_no_empl_change = resolve_hyphen(supply_constraint_no_empl_change, 'PROD_COMM')
-        supply_constraint_no_empl_change = resolve_all(supply_constraint_no_empl_change, 'PROD_COMM', [x for x in np.arange(1,121)])
+        supply_constraint_no_empl_change = resolve_all(supply_constraint_no_empl_change, 'PROD_COMM', list(self.P_IDS))
 
         self.supply_constraint_no_empl_change = supply_constraint_no_empl_change
 
@@ -818,7 +819,7 @@ class scenario:
 
         capital_change = resolve_comma(capital_change, 'PROD_COMM')
         capital_change = resolve_hyphen(capital_change, 'PROD_COMM')
-        capital_change = resolve_all(capital_change, 'PROD_COMM', [x for x in np.arange(1,121)])
+        capital_change = resolve_all(capital_change, 'PROD_COMM', list(self.P_IDS))
 
         self.capital_change = capital_change
 
@@ -840,7 +841,7 @@ class scenario:
             io_changes = resolve_comma(io_changes, 'TRAD_COMM')
             io_changes = resolve_comma(io_changes, 'PROD_COMM')
 
-            io_changes = resolve_all(io_changes, 'TRAD_COMM', [x for x in np.arange(1,57)])
+            io_changes = resolve_all(io_changes, 'TRAD_COMM', list(self.P_IDS))
 
             # ! resolve_hyphen/resolve_comma cast TRAD_COMM/PROD_COMM to str after exploding,
             # ! but resolve_all's 'ALL' expansion inserts plain ints without casting back - so a

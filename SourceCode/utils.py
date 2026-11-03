@@ -303,3 +303,13 @@ def MRIO_mat_to_df(mrio:np.ndarray, products:int, iso3:object=[]):
     mrio = mrio.drop(columns=['index','variable']) # type: ignore
     
     return mrio
+
+
+def console_color(code=""):
+    if os.name == "nt":
+        os.system(f"color {code}".strip())
+
+
+def console_title(text):
+    if os.name == "nt":
+        os.system(f"title {text}")

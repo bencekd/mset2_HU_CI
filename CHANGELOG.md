@@ -9,7 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
+### 2026-11-02 — mset2_IPCC: 10 IPCC regions × 23 sectors _[Prepared by Claude]_
+
+Merged the 2026-11-01 mset2 working-tree changes onto the HU_CI fork (`4087203`) and fixed what blocked the 23-sector baseline.
+
+#### Added
+
+* Aggregation-independent sector roles (`exog_vars.py`): `GLORIA_SECTOR_ROLES` defines cost-curve (24–26), refining (62, 63, 94), non-market (115–118), royalty (22–40) and electricity (93) sectors in GLORIA-120 codes. `gloria_sectors()` / `sector_concordance()` map them to the model's sectors through the `product_groups` sheet of whichever workbook in `Data/MSET_data/Country_groupings/` matches sheet `P` of `Variable_list_MINDSET.xlsx`; a model sector takes a role when more than half of its GLORIA sectors have it. The mapping is printed at start-up. IPCC R10×S23: cost_curve [2, 3, 4], refining [9, 10, 16], non_market [23], royalty [2–6], electricity [15].
+* Debug output `Temp/iter{year}-{iter}.csv`: rows labelled `REG_imp` × `PROD_COMM`; all components of `dq_total` added (government, investment, calibration residual, structural change, supply constraints, exogenous demand, technology substitution); a failed write no longer stops the run.
+* `console_color()` / `console_title()` helpers in `utils.py` (no-op outside Windows).
+
+#### Changed
+
+* Hard-coded GLORIA-120 / 56-sector lists replaced by sector roles: `cost_curve_employment` and `refining_sectors` (`model_class.py`), royalty sectors (`government.py`), profit-rate floor exemption (`initiate_modules.py`; was the TJK-temporary `[52, 53, 54]`), CBAM scope-2 electricity sector (`BTA.py`; was 93).
+* Scenario "ALL" sector expansion uses the model's sector list instead of 1–120 / 1–56 (`scenario.py`, `BTA.py`), except in `set_power_io_changes` (see Known issues).
+* `.ini` files: added `remittance_channel = False` and `cost_curves_run = True` (both required by the code); residuals path uses `/`.
+* Paths built with `os.path.join` (FTT settings and utilities, `Temp/` debug files); `MINDSET_dynamic_run.py` changes to its own folder; FTT model imported only when `ftt_run = True`; `results.py` `IO_PATH` default without trailing separator.
+* Unused GLORIA-120 `CRITICALITY` table no longer built (`InputOutput.py`).
+* All outputs go to `Results/`: per-year emissions, calibration summary (now `calibration_convergence_summary_{scenario}.csv`) and remittance files moved from `GLORIA_results/`, which is no longer created.
+* Archiving: at the start of a run, only the previous files of the same scenario are moved to `Results/archive_{calibration|baseline|scenario}_{scenario}_{YYYYMMDD_HHMM}/` (`calibration` = calibrating run, `baseline` = forward run of `empty`, `scenario` = others; timestamp = when they were produced; exact file-name matching so overlapping scenario names are not mixed); other scenarios stay in `Results/`. `Temp/iter*.csv` debug files are cleared at the start of every run.
+* Figure scripts (`baseline_figures.Rmd`, `scenario_figures.Rmd`): YAML `params` choose the results folder (`results_dir`; scenario figures also `baseline_dir`, `scenario`); data is read from that folder and the PDF (`baseline_figures_empty.pdf`, `scenario_figures_<scenario>.pdf`) is written into it. Fuel sectors are identified by name from sheet `P` instead of GLORIA-120 codes, and filename parsing uses only the file name. Table headers in `scenario_figures.Rmd` are built from the data (`pivot_header()`), so any number of scenarios and any scenario names work.
+* `.gitignore`: `.DS_Store`, `GLORIA_results/`.
+
+#### Fixed
+
+* `initiate_modules.py` did not parse: restored the truncated last line of the debug `DataFrame` call; rewrote a nested-quote f-string that needs Python ≥ 3.12.
+* `variables.xlsx`: registered 24 variables that the 2026Q3–Q4 code reads or writes (`save_rate_ex_windfall`, `real_income_hh`, `real_spend_hh`, `delta_y_save`, nine `dq_*` components, `dempl_hh_save`, `dempl_io_change`, `va/comp/tax/depr/profit_current`, `dk_exog`, `gov_consumption_wo_residual`, `hh_ctax_rate`, `ctax_ratchet_diag`). Dimensions corrected to match what the code writes: `flow_price_impact_hh` → (`REG_imp`, `TRAD_COMM`); `emission_cost_*` and `cbam_cost_*` for hh / fcf / gov → (`REG_imp`, `REG_exp`, `TRAD_COMM`). See `CHANGELOG_detailed.md`.
+
+#### Data (not tracked — `Data/` is git-ignored)
+
+* `initial_capital_stock_gloria.csv`: Brazil's capital stock was about 2,400× too large (97 % of world capital stock; likely the 1994 cruzeiro-real conversion in the WIOD-sourced series). Through depreciation and the profit-rate price term this pushed LAC prices up ~40 % in 2020, exploded LAC government demand in 2021 and produced NaN / frozen output from 2023. BRA, TUR, ROU, BIH, BGR, UKR, GHA and MWI were rescaled in `DATA/MSET_data_original/Investment/` so that capital ÷ gross output matches WIOD SEA 2016 (× 1.57 file-to-WIOD calibration; proxies: HRV for BIH, RUS for UKR, African peer median for GHA and MWI), then re-collapsed to R10×S23. Original kept as `initial_capital_stock_gloria_orig.csv`; factors in `initial_capital_stock_gloria_rescale_note.csv`.
+* `parameters.csv` restored to 10 regions × 23 sectors (a 120-sector version had overwritten it).
+
+
+### 2026-10-30 — 2026Q3–Q4 modifications from the HU_CI fork (commit `4087203`) _[summarised by Claude]_
+
+By Bence Kiss-Dobronyi, with contributions from Binderiya and Aron Hartvig.
+
+#### Added
+
+* Remittance channel (`remittance_channel` setting): bilateral base flows and remittances as % of GDP from a `remittances` sheet, added to exogenous household income; per-year parquet outputs aggregated after the run.
+* Exogenous prices: cost-shock `Type = exog` sets a sector's price change to the scenario value (endogenous effects removed); `exog-cprice` keeps carbon-tax pass-through.
+* Power-sector pathways: scenario sheets "Power investment" and "Power generation shares" (`set_ely_investment`, `set_power_io_changes`); zero shares are kept so technologies leaving the mix zero their input coefficients; replacements are spread across exporters by base trade shares.
+* Calibration diagnostics: `GLORIA_results/calibration_convergence_summary.csv`; previous year's residuals used on `error_revert`; `Residuals/` and `GLORIA_results/` archived at the start of a calibrating run.
+* `cost_curves_run` switch; `fuel_substitution_start` setting (default `model_start + 1`).
+* `employment.adjust_labor_productivity()`.
+
+#### Changed
+
+* Carbon tax: emission-cost ratchet (applied cost can rise by at most 2× the flow's nominal value per year) replaces the fixed cap; year-on-year differencing of revenues and costs in real terms; household carbon-tax rate differenced year on year; emission factors clipped to 0–10; out-of-range rates reported instead of clipped.
+* Household income: wage growth split into real and CPI-indexed parts (`wage_real`, `glabor_cpi`), with the indexed part deflated separately; `cpi` and `quasi_CPI` combined multiplicatively; saving benchmark built from real income and spending; windfall dissaving added (`lambda_save` 0.15, `lambda_dissave` 0.45; previously 0.1).
+* Household fuel substitution driven by real income growth and a share-weighted basket price; fuels below 1 % share ignored.
+* IO coefficient changes: blank scenario years no longer zero coefficients; `rel` applied before `replace` in each cell; consistent dtypes after ALL expansion; lines with zero base spread equally.
+* Government: royalties allowed for aggregated sectors; consumption tracked without the calibration residual (`gov_consumption_wo_residual`); emission-cost share cap removed.
+* Output decline limited per year instead of hard-zeroing negative output; price change capped at +200 %.
+* Variable validation warns and clips instead of stopping in the debugger; `Log/` created only when something is written.
+
+### Earlier unreleased changes (before 2026-10-30)
+
+#### Added
 
 * `scenario_figures.Rmd` to results, which produces standard charts for scenarios
 * added compensation share (which is `compensation/gross disposable income`) to avoid inflating income effects, this needs to be added to the `VARIABLES_list.xlsx` and to `GLORIA_template\modelinputdata\compensation_share.csv`, format for the file is below:
@@ -19,7 +77,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 | SEP     | 0.580471579                                   |
 | AFR     | 0.375162795                                   |
 
-### Fixed
+#### Fixed
 
 * Migrated all Type 1 cross-year state variables (`price_index`, `investment_price_index`, `delta_price_yoy`, `normal_output`, `normal_output_growth_helper`, `profit_rate_mean`, `cpi`, `labour_force`, `inc_exog`, `gdp_history`) from `self.DYNAMIC` dict to `self.V` (`variables_table`); see `CHANGELOG_detailed.md` for details. _[Prepared by Claude Code]_
 * Migrated 3D final demand variables (`household_consumption`, `fcf_consumption`, `government_consumption`) from `self.DYNAMIC` to `self.V`; see `CHANGELOG_detailed.md` for details. _[Prepared by Claude Code]_

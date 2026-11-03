@@ -14,7 +14,7 @@ run from command line or SPYDER
 if being run from SPYDER that's automatically detected, in that case set input variables where the code says 'SPYDER ARGUMENTS'
 
 if running from CMD you can set input arguments through specifying them in the call, i.e.:
-python RunMINDSET.py "IDN_FFSR_onlyHH" "Yes" "GLORIA_results\\baseline_residuals.xlsx"
+python RunMINDSET.py "IDN_FFSR_onlyHH" "Yes" "Residuals\\baseline_residuals.xlsx"
 
 the arguments in the CMD case are the following
 1) [required] scenario_name, this gets read in from GLORIA_template//Scenarios//XXXX.xlsx
@@ -22,7 +22,7 @@ the arguments in the CMD case are the following
 3) [optional] residual file, provide a residual file (empty scenario result) that should be subtracted from calculated results;
             note that the residuals are subtracted at the end of every year
 
-note: output file will be GLORIA_results\\FullResults_XXXX.xlsx
+note: results are written to Results/ (see CLAUDE.md)
 
 """
 #%%
@@ -36,7 +36,13 @@ note: output file will be GLORIA_results\\FullResults_XXXX.xlsx
 
 import os
 
-os.system("title MSET-v0.1.1-alpha")
+try:
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+except NameError:
+    pass
+
+if os.name == "nt":
+    os.system("title MSET-v0.1.1-alpha")
 print(" ")
 print(">>> MSET [Version v0.1.1-alpha]")
 print(">>> Model of Structural Economic Transformation")

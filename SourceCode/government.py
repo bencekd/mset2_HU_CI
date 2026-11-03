@@ -38,6 +38,7 @@ class gov:
         self.GOV = exog_vars.GOV_BASE
         self.R = exog_vars.R
         self.P = exog_vars.P
+        self.royalty_sectors = exog_vars.SECTOR_ROLES['royalty']
         self.R_list = exog_vars.R['Region_acronyms'].to_list()
         
         self.rev_proportion = scenario_data.rev_proportion
@@ -97,15 +98,10 @@ class gov:
 
         # Royalties
         # Fishing/mining/extractive sectors
-        # For 120 sectors: fishing [22, 23], mining [24, 40]
-        # For 56 sectors: forestry/fishing [10], mining/extraction [11, 18]
-        if len(self.P) == 120:
-            royalty_filter = "PROD_COMM > 21 & PROD_COMM < 41"
-        else:
-            # Generalized: select sectors that are fishing, forestry, mining, extraction
-            royalty_filter = "PROD_COMM >= 10 & PROD_COMM <= 18"
-        q_prev = self.MRIO_vec_to_df_DEF(q_prev, 'q_prev').query(royalty_filter)
-        q_curr = self.MRIO_vec_to_df_DEF(q, 'q').query(royalty_filter)
+        # fishing [22, 23]
+        # mining [24, 40]
+        q_prev = self.MRIO_vec_to_df_DEF(q_prev, 'q_prev').pipe(lambda d: d[d['PROD_COMM'].isin(self.royalty_sectors)])
+        q_curr = self.MRIO_vec_to_df_DEF(q, 'q').pipe(lambda d: d[d['PROD_COMM'].isin(self.royalty_sectors)])
         delta_royalties = self.MRIO_df_to_vec_DEF(q_curr, 'q') * (1+self.MRIO_df_to_vec_DEF(price_index, 'dp')) - self.MRIO_df_to_vec_DEF(q_prev, 'q_prev')
 
         delta_royalties = q_prev.merge(self.MRIO_vec_to_df_DEF(delta_royalties, "delta_royalties"))

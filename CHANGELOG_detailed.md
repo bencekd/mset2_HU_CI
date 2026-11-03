@@ -61,7 +61,7 @@ Three 3-dimensional final demand consumption variables (`household_consumption`,
 
 ### Design notes
 
-- All three variables are stored as flat numpy arrays (163 regions × 163 regions × 120 sectors); downstream code that requires the original indexed DataFrame form uses `read_var(..., as_df=True).rename(columns={var_name: original_col}).set_index([...])`
+- All three variables are stored as flat numpy arrays (163 regions × 163 regions × 120 sectors at full resolution; the sizes follow the active aggregation, e.g. 10 × 10 × 23 for IPCC R10×S23); downstream code that requires the original indexed DataFrame form uses `read_var(..., as_df=True).rename(columns={var_name: original_col}).set_index([...])`
 - `EXOG_VARS.HH_BASE`, `EXOG_VARS.FCF_BASE`, and `EXOG_VARS.GOV_BASE` are set from `self.V` at the start of each year `> model_start`; for `year == model_start` they retain their original values loaded by `exog_vars.py`
 - Init block (`year == model_start`) writes `year-1` values from the initial `EXOG_VARS` bases so the variable store has meaningful values from the start
 - `government_consumption` is written in two code paths: the dynamic path (drops helper columns, renames VIGA) and the base-year fallback that resets `EXOG_VARS.GOV_BASE`'s index before writing
@@ -78,10 +78,10 @@ Four-dimensional variables (indexed by `[REG_imp × PROD_COMM × REG_exp × TRAD
 
 | Method | Behaviour |
 |---|---|
-| `write_var_df(var_name, year, df)` | Writes a DataFrame as parquet to `GLORIA_results/` following the `generate_var_table` naming convention; keeps the two most recent years in an in-memory cache (`df_data`); older years are evicted from memory (parquet on disk remains available) |
+| `write_var_df(var_name, year, df)` | Writes a DataFrame as parquet to `GLORIA_results/` _(Update 2026-11-02: the code writes to `Results/`, i.e. `variables_table.results_path`)_ following the `generate_var_table` naming convention; keeps the two most recent years in an in-memory cache (`df_data`); older years are evicted from memory (parquet on disk remains available) |
 | `read_var_df(var_name, year)` | Serves from memory cache if available; loads from parquet on miss without re-caching |
 
-Parquet file naming: `results_file_long_{scenario_name}_{var_name}_{year}.parquet`
+Parquet file naming: `results_file_long_{scenario_name}_{var_name}_{year}.parquet` (in `Results/`)
 
 ### Variables migrated
 
@@ -104,6 +104,8 @@ Parquet file naming: `results_file_long_{scenario_name}_{var_name}_{year}.parque
 - `SourceCode/initiate_modules.py`
 - `SourceCode/model_class.py`
 - `SourceCode/ftt_power.py`
+
+> **Update 2026-11-02:** `emission_cost_hh/fcf/gov` and `cbam_cost_hh/fcf/gov` are now registered with dimensions `[REG_imp, REG_exp, TRAD_COMM]` (no `PROD_COMM`), matching what the code writes; see the 2026-11-02 entry below.
 
 ### Design notes
 
@@ -141,5 +143,137 @@ If `SWITCH_WITHIN_YEAR_LOOP = False`, the loop body never executes and `self.V` 
 ### Files changed
 
 - `SourceCode/initiate_modules.py`
+
+---
+
+## 2026-11-02 — Aggregation-independent sector roles
+
+### Summary
+
+Several modules used GLORIA-120 sector numbers directly (cost-curve sectors 24–26, refining 62/63/94, non-market 115–118, royalty sectors 22–40, electricity 93), and the HU_CI fork had partly replaced them with 56-sector numbers. Both are wrong for any other aggregation. Roles are now defined once in GLORIA-120 codes and mapped to the active aggregation at start-up.
+
+### How it works (`SourceCode/exog_vars.py`)
+
+| Item | Behaviour |
+|---|---|
+| `GLORIA_SECTOR_ROLES` | Module-level dict of role → GLORIA-120 sector list |
+| `exog_vars.SECTOR_ROLES` | Same roles in model sector numbers, built in `__init__` |
+| `gloria_sectors(ids)` | With 120 sectors returns `ids` unchanged; otherwise a model sector gets the role when **more than half** of its GLORIA sectors are in `ids` |
+| `sector_concordance()` | Scans `Data/MSET_data/Country_groupings/*.xlsx` (skipping `~$` lock files) for a `product_groups` sheet with 120 rows and columns `Lfd_Nr`, `Lfd_Nr_agg`, `Agg_sector_name`, and uses the one whose (`Lfd_Nr_agg`, `Agg_sector_name`) pairs equal (`Lfd_Nr`, `Sector_names`) in sheet `P` of `Variable_list_MINDSET.xlsx` (names compared after stripping spaces) |
+
+Start-up prints, for example: `--- Sector roles (IPCC_regions_23sectors.xlsx): cost_curve [2, 3, 4]; refining [9, 10, 16]; non_market [23]; royalty [2, 3, 4, 5, 6]; electricity [15] ---`.
+
+### Where roles are used
+
+| Role | Used in | Replaces |
+|---|---|---|
+| `cost_curve` | `model_class.py` `cost_curve_employment` | `[24, 25, 26]` / HU_CI `[]` |
+| `refining` | `model_class.py` `refining_sectors` → `ener_balance` | `[62, 63, 94]` / HU_CI `[23, 24, 35]` |
+| `non_market` | `initiate_modules.py` profit-rate floor exemption | `[115…118]` / HU_CI `[52, 53, 54]` |
+| `royalty` | `government.py` royalty revenue | `PROD_COMM 22–40` / HU_CI `10–18` |
+| `electricity` | `BTA.py` CBAM scope-2 emissions | `93` |
+
+Scenario "ALL" expansion uses `scenario.P_IDS` (the model's sector list) instead of `np.arange(1, 121)` or `np.arange(1, 57)`.
+
+### Design notes
+
+- No setting is needed: the grouping workbook is found by matching sector numbers **and** names with sheet `P`. Start-up stops with `FileNotFoundError` if no workbook matches, and with `ValueError` if several match but disagree.
+- A role can disappear when its GLORIA sectors are merged into a larger sector made mostly of other activities; check the printed line after changing the aggregation.
+- Not yet converted: `set_power_io_changes` (ALL → 1–56) and the FTT code paths (sector 93).
+
+---
+
+## 2026-11-02 — `variables.xlsx` registrations and dimension corrections
+
+### Summary
+
+The 2026Q3–Q4 code (HU_CI fork) writes and reads variables through `self.V` that were never added to `variables.xlsx`, so the first baseline year stopped with `IndexError` in `write_var` (`save_rate_ex_windfall`). 24 variables were registered and 7 existing rows were corrected.
+
+### Variables added (all `TYPE = FLOAT16`)
+
+| Dimensions | Variables | Bounds |
+|---|---|---|
+| `REG_imp` | `save_rate_ex_windfall` | −Inf … 1 (as `save_rate`) |
+| `REG_imp` | `real_income_hh`, `real_spend_hh` | −Inf … Inf |
+| `REG_imp`, `PROD_COMM` | `dq_structural_change`, `dq_hh_tech_substitution`, `dq_calibration_residual`, `dq_hh_exog_fd`, `dq_hh_exog`, `dq_gov_exog_fd`, `dq_fcf_exog_fd`, `dq_supply_constraint`, `dq_supply_constraint_no_empl`, `dempl_hh_save`, `dempl_io_change`, `va_current`, `comp_current`, `tax_current`, `depr_current`, `profit_current`, `dk_exog` | −Inf … Inf |
+| `REG_imp`, `TRAD_COMM`, `REG_exp` | `delta_y_save`, `gov_consumption_wo_residual` | −Inf … Inf |
+| `REG_imp`, `TRAD_COMM`, `REG_exp` | `hh_ctax_rate` (`write_var_df`) | none |
+| `REG_imp`, `REG_exp`, `PROD_COMM`, `TRAD_COMM` | `ctax_ratchet_diag` (`write_var_df`) | none |
+
+Bounds are open because `write_var` now clips out-of-range values (2026Q3–Q4 change); a tight bound would silently change results.
+
+### Dimension corrections
+
+| Variable | Was | Now | Reason |
+|---|---|---|---|
+| `flow_price_impact_hh` | `REG_imp`, `PROD_COMM`, `TRAD_COMM` | `REG_imp`, `TRAD_COMM` | Code drops `PROD_COMM` (always `FD_1`) before writing |
+| `emission_cost_hh/fcf/gov` | `REG_imp`, `REG_exp`, `PROD_COMM`, `TRAD_COMM` | `REG_imp`, `REG_exp`, `TRAD_COMM` | Code drops `PROD_COMM`; readers re-add it with `.assign(PROD_COMM='FD_x')` |
+| `cbam_cost_hh/fcf/gov` | `REG_imp`, `REG_exp`, `PROD_COMM`, `TRAD_COMM` | `REG_imp`, `REG_exp`, `TRAD_COMM` | `PROD_COMM` holds `FD_1/3/4`, which `write_var_df` rejects as invalid sector codes once CBAM is non-zero |
+
+Each corrected row has a note in the `Note` column with its old dimensions.
+
+### Rules for new variables
+
+- `write_var` / `read_var`: the name must be in sheet `vars`, otherwise `IndexError` when looking up its empty table. With `from_df=True` the DataFrame needs the dimension columns plus a column named exactly like the variable.
+- `write_var_df`: the name must be registered, every listed dimension must be a column, and each dimension's values must belong to the model's lists (`REG_imp`/`REG_exp` regions, `PROD_COMM`/`TRAD_COMM` model sectors, `FD` = `FD_1`, `FD_3`, `FD_4`); extra columns are allowed.
+- `PERSISTENT` is informational only; `MIN`/`MAX` are enforced by `write_var` (warn and clip).
+
+---
+
+## 2026-11-02 — Debug iteration file
+
+`initiate_modules.py` writes `Temp/iter{year}-{iter}.csv` on every within-year iteration after the first. Rows are labelled `REG_imp` × `PROD_COMM`; columns are `output` (= `dq_total` before the labour-supply constraint), every component of `dq_total`, employment change, price changes (`current` = `dp_all`) and the direct price effects available at that point (`v_all`, `v_labor`, `v_dev_normal_output`, `v_costcurve`, `v_output_growth`). `v_dev_profit_rate`, `v_ctax`, `v_cbam`, `v_exog` and `v_scarcity_rent` are not written; `v_all` minus the listed effects gives their sum. A failed write prints a message instead of stopping the run.
+
+---
+
+## 2026-11-02 — Capital stock data correction (data only; `Data/` is git-ignored)
+
+### Symptom
+
+Baseline (R10×S23, empty scenario) produced zero changes from 2023 onward: within-year iterations diverged in LAC services, `dq_hh_inc` became infinite, the year ended in NaN and every later year stayed at 2022 levels.
+
+### Chain
+
+1. `initial_capital_stock_gloria.csv`: Brazil's capital stock was ~2,400× too large (1.95e13 thousand USD; 97 % of world capital in the file). Brazil's series comes from WIOD SEA; dividing by 2,750 (1994 cruzeiro-real → real) gives a plausible capital/output of 2.0–2.3.
+2. LAC depreciation ÷ capital fell below the 0.1 % floor, so depreciation came out at ~2× LAC output; model profit rates hit the −1 clip; `profit_rate_min` (which scales with capital/output) hit its 0.95 cap.
+3. The profit-rate price term raised LAC prices ~40 % in 2020 (other regions 2–4 %).
+4. Capital-tax revenue grows with the change in positive profits (`government.calc_endog_spending_change`); from a near-zero base it exploded, and LAC government demand rose by 6.5e9 in 2021 (≈ 5× its budget), mostly in sector 23.
+5. Calibration failed in 2020–2022 and 2023 diverged.
+
+### Fix
+
+In `DATA/MSET_data_original/Investment/` (source of `collapse_MRIO.py`), BRA, TUR, ROU, BIH, BGR, UKR, GHA and MWI were each multiplied by one factor (all sectors, years and the `HH` row) so that capital ÷ GLORIA gross output (2016–19 average) equals the WIOD SEA 2016 ratio `K / GO` (2010–14 average) × 1.569, the median file-to-WIOD ratio of 39 normal WIOD countries. Proxies: Croatia for BIH, Russia for UKR, the median of 40 African countries in the file for GHA and MWI. Original: `initial_capital_stock_gloria_orig.csv`; factors and method: `initial_capital_stock_gloria_rescale_note.csv`. Region capital/output after collapsing: LAC 2,078 → 3.19, EUR 8.64 → 2.58, AFR 4.06 → 3.15, EEA 4.28 → 3.82.
+
+Sources: WIOD 2016 release, Socio-Economic Accounts and exchange rates (DataverseNL files 199095 and 199097).
+
+---
+
+## 2026-11-02 — Single `Results/` folder, per-scenario archives and figure folders
+
+### Summary
+
+The 2026Q3–Q4 code wrote some outputs to `GLORIA_results/` and archived that whole folder at the start of every run. All outputs now go to `Results/`, archives are per scenario, and the figure scripts can plot any results folder.
+
+### Model side (`SourceCode/model_class.py`)
+
+| Item | Behaviour |
+|---|---|
+| `ModelRun.RESULTS_DIR` | `"Results"`; used for `emissions_{scenario}_{year}.parquet`, `remittance_{scenario}[_{year}].parquet` and `calibration_convergence_summary_{scenario}.csv` (`results.py` FullResults path too, unused) |
+| `_is_result_of_scenario(fname, scenario, var_names)` | Exact patterns: `results_file_long_{s}_{n}.(csv\|parquet)`, `results_file_long_{s}_{registered variable}_{YYYY}.parquet`, `emissions_{s}_{YYYY}.parquet`, `remittance_{s}[_{YYYY}].parquet`, `calibration_convergence_summary_{s}.csv`, `(baseline\|scenario)_figures_{s}.pdf` |
+| `_archive_scenario_results()` | At run start, moves the matching files to `Results/archive_{kind}_{scenario}_{YYYYMMDD_HHMM}/`; `kind` = `calibration` if a calibration summary is among them (calibrating run), `baseline` for a forward run of `BASELINE_SCENARIO` (`empty`), else `scenario`; timestamp = newest file's modification time; `_2`, `_3`, … if the folder exists |
+| `_clear_temp_iterations()` | Deletes `Temp/iter*-*.csv` at run start |
+| `Residuals/` | Unchanged: `_archive_folder("Residuals")` at the start of a calibrating run |
+| `_cleanup_working_parquets()` | Still not called; now points at `Results/`, and its docstring warns that it would delete the per-year files the figure scripts read |
+
+Prefix matching would be wrong here: `cprice_disagg` is a prefix of `cprice_disagg_rr`, `_hh`, `_full`, and the variable `hh_ctax_rate` makes a `cprice_disagg` file look like scenario `cprice_disagg_hh`. Tested on these cases and with two consecutive 2019–2020 baseline runs in a throwaway copy.
+
+### Figure scripts (`Results/*.Rmd`)
+
+- YAML `params`: `results_dir` (both), `baseline_dir` and `scenario` (scenario figures); folders are relative to `Results/`.
+- `rfiles(pattern)` replaces `list.files(pattern = ...)`: baseline figures read only baseline (`empty`) files from `results_dir`; scenario figures read baseline files from `baseline_dir` and scenario files (all non-baseline scenarios, or `scenario`) from `results_dir`.
+- `str_extract(basename(filename), ...)`: the scenario and year are taken from the file name only (an archive folder name contains a timestamp that would otherwise be read as a year).
+- A `knit:` function in the YAML renders into `results_dir` with output names `baseline_figures_empty.pdf` and `scenario_figures_<scenario>.pdf` (`_all` when several scenarios are plotted), so PDFs are archived together with their results.
+- `scenario_figures.Rmd` table headers: the hard-coded two-scenario headers (`cprice` / `cprice_rr` under each year) are replaced by `pivot_header()`, which builds both header rows from the pivoted table's columns. With any other number of scenarios the hard-coded headers had more columns than the table (LaTeX "Extra alignment tab"), and with other names they were mislabelled.
+- Fuel sectors (`fuel_of`, `fuel_detail_of`, `primary_fuel_sectors`) are built from sector names in sheet `P` of `Variable_list_MINDSET.xlsx`.
 
 ---

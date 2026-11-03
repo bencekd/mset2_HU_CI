@@ -19,7 +19,7 @@ import os
 
 def read_support():
 
-    path = 'utilities\\titles'
+    path = os.path.join('utilities', 'titles')
 
     lagged_sales = pd.read_excel(os.path.join(path,'Lagged_sales.xlsx'), index_col = 0, header=0, sheet_name = None)
 

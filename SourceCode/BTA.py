@@ -44,6 +44,7 @@ class BTA:
         self.ALL_POLLUTANTS = exog_vars.ALL_POLLUTANTS
         self.ALL_PROCESS_EMISSIONS = exog_vars.ALL_PROCESS_EMISSIONS
         self.temp = temp
+        self.electricity_sectors = [str(s) for s in exog_vars.SECTOR_ROLES['electricity']]
         self.YEAR = scenario.YEAR
 
         try:
@@ -69,7 +70,7 @@ class BTA:
         # resolve keys
         cbam_setup = resolve_comma(cbam_setup, 'TRAD_COMM') #type:ignore
         cbam_setup = resolve_hyphen(cbam_setup, 'TRAD_COMM')
-        cbam_setup = resolve_all(cbam_setup, 'TRAD_COMM', [x for x in np.arange(1,121)])
+        cbam_setup = resolve_all(cbam_setup, 'TRAD_COMM', [int(x) for x in exog_vars.P_list])
 
 
         cbam_setup = resolve_comma(cbam_setup, 'REG_imp')
@@ -203,11 +204,11 @@ class BTA:
         # process_emissions = process_emissions[['REG_imp','PROD_COMM','REG_exp','TRAD_COMM','PROCESS_EMISSION']]
 
         # ? calc SCOPE2
-        scope2 = self.emission_matrix.query("PROD_COMM == '93'").groupby(['REG_imp']).agg({'emission_ktco2':'sum'}).reset_index()
+        scope2 = self.emission_matrix.pipe(lambda d: d[d['PROD_COMM'].astype(str).isin(self.electricity_sectors)]).groupby(['REG_imp']).agg({'emission_ktco2':'sum'}).reset_index()
         scope2 = scope2.rename(columns={'REG_imp':'REG_exp'})
         # ['REG_exp','emission_ktco2'] <- electricity generation emissions by country
        
-        electricity_share = self.emission_matrix.query("TRAD_COMM == 93").drop(columns=['TRAD_COMM'])
+        electricity_share = self.emission_matrix.pipe(lambda d: d[d['TRAD_COMM'].astype(str).isin(self.electricity_sectors)]).drop(columns=['TRAD_COMM'])
         electricity_share['share'] = electricity_share['z_bp'] / electricity_share.groupby(['REG_exp'])['z_bp'].transform('sum')
         electricity_share = electricity_share[['REG_exp','REG_imp','PROD_COMM','share']].copy()
         # ['REG_exp','REG_imp','PROD_COMM','share'] <- electricity use shares by producer

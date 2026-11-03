@@ -13,6 +13,7 @@ ModelRun class: main class for operation of model.
 
 # Standard library imports
 import configparser
+import os
 import copy
 
 # Third party imports
@@ -95,7 +96,7 @@ class ModelRun:
 
         # Attributes given in settings.ini file
         config = configparser.ConfigParser()
-        config.read('MINDSET_FTT_Power/settings.ini')
+        config.read(os.path.join('MINDSET_FTT_Power', 'settings.ini'))
         self.name = config.get('settings', 'name')
         self.model_start = int(config.get('settings', 'model_start'))
         self.model_end = int(config.get('settings', 'model_end'))
